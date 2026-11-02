@@ -3,7 +3,8 @@
 #   - links every skill into ~/.claude/skills/ (available in all Claude Code sessions)
 #   - links the `rh` helper into ~/.local/bin/
 #   - optionally creates a hub:  ./install.sh --hub ~/research-hub
-# Re-run after `git pull` to pick up new skills. Remove with: ./install.sh --uninstall
+# To update an existing install: `rh update` (pulls, re-runs this, syncs the hub).
+# Remove with: ./install.sh --uninstall
 set -euo pipefail
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS_DIR="$HOME/.claude/skills"
@@ -28,6 +29,15 @@ for s in "$KIT_DIR"/skills/*/; do
   fi
   ln -sfn "${s%/}" "$SKILLS_DIR/$n"
   echo "skill  $n"
+done
+# Skills removed from the kit leave broken links behind: drop them.
+KIT_SKILLS="$(cd "$KIT_DIR/skills" && pwd -P)"
+for l in "$SKILLS_DIR"/rh-*; do
+  [ -L "$l" ] && [ ! -e "$l" ] || continue
+  parent="$(cd "$(dirname "$(readlink "$l")")" 2>/dev/null && pwd -P)" || continue
+  if [ "$parent" = "$KIT_SKILLS" ]; then
+    rm "$l" && echo "removed skill $(basename "$l") (no longer in the kit)"
+  fi
 done
 chmod +x "$KIT_DIR/bin/rh" "$KIT_DIR/templates/launch/"*.sh
 ln -sfn "$KIT_DIR/bin/rh" "$BIN_DIR/rh"

@@ -62,6 +62,14 @@ account, QoS, modules). No passwords or keys go in this file. `rh doctor`
 counts the TODOs left. Claude never guesses these values: anything left as
 TODO stays TODO in the generated scripts.
 
+If you already used this machine for your experiments, `rh suggest-compute`
+lists values found in your repos' launch scripts, shell history and Claude Code
+transcripts, with where each came from (it prints only the matched values, never
+the surrounding text). After step 3, ask Claude `/rh-setup-compute` to go
+through them with you and fill the file; it writes only what you confirm.
+
+The file is git-ignored: it never goes into the hub's git or to GitHub.
+
 ## 3. Log Claude Code in with your claude.ai account
 
 ```bash
@@ -108,9 +116,41 @@ In a new session:
 
 ## Using it on another machine
 
-Clone and install the kit, clone your hub repo, then re-link the code bases
+Clone and install the kit, clone your hub repo, run `rh init-hub <hub path>`
+(registers it and adds a blank `compute.yaml`), then re-link the code bases
 that live on that machine (`rh link-repo <path>` — the projects refer to repos
 by name, so nothing else changes). Fill that machine's `compute.yaml`.
+
+## Updating
+
+```bash
+rh update            # pull the kit, re-link skills, merge into hub files
+rh update --dry-run  # preview only
+```
+Kit installed before `rh update` existed: run once
+`cd ~/tools/research-kit && git pull && rh update --no-pull`.
+
+Your edits to the hub's `CLAUDE.md`, `settings.json`, `hub.sh` and
+`compute.yaml` are kept: kit changes are merged in. If a file can't be merged
+automatically, yours is kept and the kit's version is written next to it as
+`<file>.kit-new`; ask Claude `/rh-update` to merge it with you. Nothing is
+committed: review with `git status` / `git diff` in the hub and commit yourself.
+If `hub.sh` changed, restart the tmux session (the command is printed).
+
+## Private compute.yaml
+
+Hubs created before compute.yaml was git-ignored committed it. `rh update`
+untracks it (the file stays on disk); commit that removal. It is still in past
+commits, so if the hub was pushed, rewrite its history yourself:
+```bash
+pip install git-filter-repo
+cd ~/research-hub
+git filter-repo --path compute.yaml --invert-paths   # removes the 'origin' remote
+git remote add origin <url>
+git push --force --all
+```
+Other clones of the hub must then be re-cloned. `rh doctor` warns while the
+file is still in the history.
 
 ## Troubleshooting
 
@@ -123,3 +163,5 @@ by name, so nothing else changes). Fill that machine's `compute.yaml`.
 | Claude keeps asking permission for a command | Add it to `allow` in `~/research-hub/.claude/settings.json` |
 | `repos/x` BROKEN in `rh repos` | The code moved: `rh unlink-repo x && rh link-repo <new path> --name x` |
 | Push fails | Expected without GitHub credentials on the server; push yourself from the worktree |
+| `rh update`: "has local changes" | You edited the kit itself: commit or stash in the kit dir, then rerun |
+| `<file>.kit-new` next to a hub file | Kit change that couldn't be merged automatically: `/rh-update` |
