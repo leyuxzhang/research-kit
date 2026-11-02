@@ -169,5 +169,6 @@ file is still in the history.
 | Claude keeps asking permission for a command | Add it to `allow` in `~/research-hub/.claude/settings.json` |
 | `repos/x` BROKEN in `rh repos` | The code moved: `rh unlink-repo x && rh link-repo <new path> --name x` |
 | Push fails | Expected without GitHub credentials on the server; push yourself from the worktree |
+| `git pull` in the kit: "local changes … would be overwritten" (`bin/rh`, `install.sh`) | Only the `chmod +x` permissions differ: `git -c core.fileMode=false pull`, or just use `rh update` |
 | `rh update`: "has local changes" | You edited the kit itself: commit or stash in the kit dir, then rerun |
 | `<file>.kit-new` next to a hub file | Kit change that couldn't be merged automatically: `/rh-update` |

@@ -9,7 +9,8 @@ description: Update research-kit on this machine (pull the kit, re-link skills, 
 `rh update`. It pulls the kit (fast-forward only), re-runs `install.sh`, then
 merges kit changes into the hub's copies of the template files, keeping my
 edits. If the pull needs credentials, it fails instead of hanging: give me the
-exact command (`cd <kit> && git pull --ff-only`), then run `rh update --no-pull`.
+exact command (`cd <kit> && git -c core.fileMode=false pull --ff-only`), then
+run `rh update --no-pull`.
 If the kit has local changes, stop and tell me; don't stash or reset them.
 
 Use `rh update --dry-run` first if I only want to see what would change.
