@@ -2,6 +2,10 @@
 repos/
 worktrees/
 .claude/settings.local.json
+# Private and machine-specific: never commit or push
+compute.yaml
+compute.yaml.bak
+*.kit-new
 # Heavy or generated
 **/__pycache__/
 *.ckpt

@@ -11,6 +11,7 @@ Run `rh -h` or `rh <command> -h` for help.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import json
 import os
@@ -18,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 KIT_DIR = Path(__file__).resolve().parent.parent
@@ -29,6 +31,9 @@ CONFIG_FILE = (
     / "config.json"
 )
 MARKER = ".research-hub"
+COMPUTE = "compute.yaml"
+# compute.yaml is private and machine-specific: it must never reach the hub's git.
+PRIVATE_IGNORES = ["compute.yaml", "compute.yaml.bak", "*.kit-new"]
 
 PLAN_STATUSES = [
     "draft", "approved", "designed", "implementing", "implemented",
@@ -238,16 +243,136 @@ def table_rows(text: str):
     return rows, headers, hdr, i
 
 
+def read_marker(hub: Path) -> dict:
+    d = {}
+    for line in (hub / MARKER).read_text().splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def write_marker(hub: Path, **updates) -> None:
+    d = read_marker(hub)
+    d.update(updates)
+    (hub / MARKER).write_text("".join(f"{k}: {v}\n" for k, v in d.items()))
+
+
+def kit_head():
+    r = git(KIT_DIR, "rev-parse", "HEAD", check=False)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def kit_template_at(commit: str, rel: str):
+    """A hub-template file as it was at a kit commit (None if it didn't exist)."""
+    r = git(KIT_DIR, "show", f"{commit}:hub-template/{rel}", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def kit_template_history(rel: str) -> list:
+    """Every past version of a hub-template file, newest first."""
+    r = git(KIT_DIR, "log", "--format=%H", "--", f"hub-template/{rel}", check=False)
+    versions = (kit_template_at(c, rel) for c in r.stdout.split())
+    return [v for v in versions if v is not None]
+
+
+def guess_base_commit(hub: Path):
+    """For hubs made before kit_commit was recorded: the kit before the last
+    `git pull` (ORIG_HEAD), else the kit as of the hub's creation day. A guess
+    equal to HEAD would hide kit changes, so it is dropped (-> .kit-new)."""
+    head = kit_head()
+    orig = git(KIT_DIR, "rev-parse", "-q", "--verify", "ORIG_HEAD", check=False).stdout.strip()
+    created = read_marker(hub).get("created")
+    dated = git(KIT_DIR, "rev-list", "-1", f"--before={created} 23:59:59", "HEAD",
+                check=False).stdout.strip() if created else ""
+    for c in (orig, dated):
+        if c and c != head:
+            return c
+    return None
+
+
+def template_files() -> list:
+    return sorted(p.relative_to(HUB_TEMPLATE).as_posix()
+                  for p in HUB_TEMPLATE.rglob("*") if p.is_file())
+
+
+def write_lf(path: Path, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Replace by rename, so a running `bash hub.sh` keeps reading the old file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".rh-tmp")
+    write_lf(tmp, text)
+    if path.exists():
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
+def merge3(cur: str, base: str, new: str):
+    """3-way merge with `git merge-file`; None if it conflicts."""
+    with tempfile.TemporaryDirectory() as d:
+        files = []
+        for name, text in (("hub", cur), ("base", base), ("kit", new)):
+            f = Path(d) / name
+            write_lf(f, text)
+            files.append(str(f))
+        r = subprocess.run(["git", "merge-file", "-p", *files], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def compute_tracked(hub: Path) -> bool:
+    return (hub / ".git").exists() and git(
+        hub, "ls-files", "--error-unmatch", COMPUTE, check=False).returncode == 0
+
+
+def compute_placeholders(text: str) -> set:
+    """Dotted keys of compute.yaml whose value is still TODO (tiny YAML subset)."""
+    keys, stack, block = set(), [], None
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if block and (not line.strip() or indent > block[0]):
+            if "TODO" in line:
+                keys.add(block[1])
+            continue
+        block = None
+        s = line.strip()
+        m = re.match(r"([\w-]+):\s*(.*)$", s)
+        if not s or s.startswith("#") or not m:
+            continue
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = ".".join([k for _, k in stack] + [m.group(1)])
+        val = m.group(2).split(" #")[0].strip()
+        if val.startswith("{"):
+            for k, v in re.findall(r"([\w-]+):\s*([^,}]+)", val):
+                if v.strip() == "TODO":
+                    keys.add(f"{path}.{k}")
+        elif val.startswith("|"):
+            block = (indent, path)
+        elif val == "TODO":
+            keys.add(path)
+        stack.append((indent, m.group(1)))
+    return keys
+
+
 # ---------------------------------------------------------------- commands
 def cmd_init_hub(a):
     path = Path(a.path).expanduser().resolve()
     if (path / MARKER).exists():
         print(f"Hub already exists at {path}")
+        if not (path / COMPUTE).exists():  # e.g. a hub cloned from GitHub: compute.yaml is never pushed
+            shutil.copy2(HUB_TEMPLATE / COMPUTE, path / COMPUTE)
+            print(f"Added a blank {COMPUTE} for this machine")
     else:
         if path.exists() and any(path.iterdir()) and not a.force:
             die(f"{path} exists and is not empty (use --force to add hub files into it)")
         shutil.copytree(HUB_TEMPLATE, path, dirs_exist_ok=True)
-        (path / MARKER).write_text(f"created: {today()}\nkit: {KIT_DIR}\n")
+        head = kit_head()
+        (path / MARKER).write_text(f"created: {today()}\nkit: {KIT_DIR}\n"
+                                   + (f"kit_commit: {head}\n" if head else ""))
         for d in ("projects", "repos", "worktrees"):
             (path / d).mkdir(exist_ok=True)
         (path / "hub.sh").chmod(0o755)
@@ -260,7 +385,8 @@ def cmd_init_hub(a):
     cfg = load_config()
     cfg["hub"] = str(path)
     save_config(cfg)
-    print("Next: edit compute.yaml, then start the Remote Control server (see docs/SETUP.md).")
+    print("Next: fill compute.yaml (`rh suggest-compute` shows values found on this machine,\n"
+          "or ask Claude: /rh-setup-compute), then start the Remote Control server (see docs/SETUP.md).")
 
 
 def do_link(hub: Path, real: Path, name, project=None, role=""):
@@ -575,7 +701,333 @@ def cmd_doctor(a):
         if comp.exists():
             todos = comp.read_text().count("TODO")
             report(todos == 0, f"compute.yaml: {todos} TODO value(s) left", "WARN")
+        head = kit_head()
+        if head:
+            report(read_marker(hub).get("kit_commit") == head,
+                   "hub files synced with the kit (else: rh update)", "WARN")
+        pending = [r for r in template_files() if (hub / (r + ".kit-new")).exists()]
+        report(not pending, "no pending kit merges" + (f": {', '.join(pending)}" if pending else ""),
+               "WARN")
+        if (hub / ".git").exists():
+            report(not compute_tracked(hub),
+                   "compute.yaml not tracked by the hub's git (private; rh update untracks it)")
+            hist = git(hub, "log", "--all", "--format=%h", "--", COMPUTE, check=False).stdout.split()
+            report(not hist, f"compute.yaml absent from hub git history ({len(hist)} commit(s) "
+                   "contain it; if the hub was pushed, see 'Private compute.yaml' in docs/SETUP.md)",
+                   "WARN")
     print("\nAll good." if problems == 0 else f"\n{problems} problem(s) found.")
+
+
+def sync_hub(hub: Path, dry_run: bool) -> list:
+    """Bring kit changes to hub-template/ into the hub without losing the user's
+    edits: 3-way merge against the template as of the last sync (kit_commit in
+    the marker). A conflicting file is left alone; the kit's version is written
+    next to it as <file>.kit-new for the user (or /rh-update) to merge."""
+    head = kit_head()
+    base_commit = (read_marker(hub).get("kit_commit") or guess_base_commit(hub)) if head else None
+    changed = []
+    for rel in template_files():
+        new = (HUB_TEMPLATE / rel).read_text(encoding="utf-8")
+        dest = hub / rel
+        pending = dest.with_name(dest.name + ".kit-new")
+        cur = dest.read_text(encoding="utf-8") if dest.exists() else None
+        base = kit_template_at(base_commit, rel) if base_commit else None
+        if head and cur not in (None, new, base) and cur in kit_template_history(rel):
+            base = cur  # an untouched copy of an older template: just update it
+        text = None
+        if cur == new:
+            action = "up to date"
+        elif cur is None:
+            action, text = "added", new
+        elif base is not None and cur == base:
+            action, text = "updated", new
+        elif base is not None and new == base:
+            action = "kept (your version)"
+        else:
+            text = merge3(cur, base, new) if base is not None else None
+            action = "merged" if text is not None else "CONFLICT -> " + pending.name
+        if pending.exists() and text is None and cur != new:
+            action += " (merge pending: " + pending.name + ")"
+        print(f"  {action:<24} {rel}")
+        if dry_run:
+            continue
+        if cur == new or text is not None:
+            if pending.exists():
+                pending.unlink()
+        elif action.startswith("CONFLICT") or pending.exists():
+            write_atomic(pending, new)
+        if text is not None:
+            if rel == COMPUTE and cur is not None:  # not under git, so keep a copy
+                write_lf(hub / "compute.yaml.bak", cur)
+            write_atomic(dest, text)
+            if rel.endswith(".sh"):
+                dest.chmod(0o755)
+            changed.append(rel)
+    if head and not dry_run:
+        write_marker(hub, kit_commit=head)
+    return changed
+
+
+def make_compute_private(hub: Path, dry_run: bool) -> bool:
+    """Make sure compute.yaml is git-ignored and untracked. True if it was untracked now."""
+    gi = hub / ".gitignore"
+    lines = gi.read_text().splitlines() if gi.exists() else []
+    missing = [p for p in PRIVATE_IGNORES if p not in lines]
+    if missing:
+        print(f"  {'ignore added':<24} .gitignore: {', '.join(missing)}")
+        if not dry_run:
+            with gi.open("a") as f:
+                f.write("\n# Private and machine-specific (added by rh update)\n"
+                        + "\n".join(missing) + "\n")
+    if not compute_tracked(hub):
+        return False
+    print(f"  {'untracked (kept on disk)':<24} {COMPUTE}")
+    if not dry_run:
+        git(hub, "rm", "--cached", "-q", COMPUTE)
+    return True
+
+
+def cmd_update(a):
+    if a.dry_run:
+        print("Dry run: nothing is pulled or written.")
+    elif not a.no_pull:
+        if not (KIT_DIR / ".git").exists():
+            die(f"{KIT_DIR} is not a git clone: update it yourself, then run `rh update --no-pull`")
+        if git(KIT_DIR, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            die(f"the kit at {KIT_DIR} has local changes; commit or stash them first")
+        old = kit_head()
+        print(f"Pulling the kit in {KIT_DIR}")
+        if subprocess.run(["git", "-C", str(KIT_DIR), "pull", "--ff-only"]).returncode != 0:
+            die("git pull failed (see above); nothing else was changed")
+        if kit_head() != old:  # finish with the freshly pulled rh
+            os.execv(sys.executable, [sys.executable, str(KIT_DIR / "bin" / "rh"), "update", "--no-pull"])
+    if not a.dry_run:
+        print("\nRe-linking skills and rh", flush=True)
+        subprocess.run([shutil.which("bash") or "bash", str(KIT_DIR / "install.sh")], check=True)
+    hub = find_hub(required=False)
+    if not hub:
+        print("\nNo hub found: kit, skills and rh are up to date.")
+        return
+    print(f"\nHub files in {hub}:")
+    changed = sync_hub(hub, a.dry_run)
+    untracked = make_compute_private(hub, a.dry_run)
+    if a.dry_run:
+        return
+    pending = [r for r in template_files() if (hub / (r + ".kit-new")).exists()]
+    print()
+    if pending:
+        print("Needs a merge (your file was kept; the kit's version is next to it):")
+        for r in pending:
+            print(f"  {r}  <-  {r}.kit-new")
+        print("Ask Claude to run /rh-update, or merge by hand and delete the .kit-new file.")
+    if COMPUTE in changed:
+        print(f"{COMPUTE} updated; your previous version is in compute.yaml.bak.")
+    if "hub.sh" in changed:
+        print("hub.sh changed: restart the server to use it:\n"
+              "  tmux kill-session -t research-hub; "
+              "tmux new -d -s research-hub \"bash -lc '$HOME/research-hub/hub.sh'\"")
+    if untracked:
+        print(f"{COMPUTE} is no longer tracked by git (it stays on disk). It is still in past\n"
+              "commits: if the hub was pushed, see 'Private compute.yaml' in docs/SETUP.md.")
+    if [r for r in changed if r != COMPUTE] or untracked:
+        print(f"Nothing was committed. Review and commit:  cd {hub} && git status && git diff")
+    print("New Claude sessions pick up the updated skills and CLAUDE.md.")
+
+
+# Suggestions for compute.yaml. Each rule maps a regex match to (key, value)
+# pairs. Only these captured values are ever printed, never the text around
+# them: shell history and transcripts can contain secrets.
+CODE_SEG = r"^(code|src|repos?|git|projects?)$"
+RES_SEG = r"^(results?|outputs?|runs|experiments?|exps?)$"
+COMPUTE_KEYS = [
+    "lab_server.results_root", "lab_server.smoke_test", "lab_server.python_env",
+    "oar.frontend", "oar.code_root", "oar.results_root", "oar.queue", "oar.resources",
+    "oar.gpu_property", "oar.walltime", "oar.env_setup",
+    "jeanzay.login", "jeanzay.account", "jeanzay.gpus.v100.qos", "jeanzay.gpus.a100.qos",
+    "jeanzay.gpus.h100.qos", "jeanzay.code_root", "jeanzay.results_root", "jeanzay.modules",
+]
+LAUNCH_SUFFIXES = {".slurm", ".sbatch", ".sh", ".oar", ".bash"}
+SKIP_DIRS = {"node_modules", "venv", "__pycache__", "wandb", "checkpoints", "data"}
+SECRET_RE = re.compile(r"ghp_|gho_|github_pat_|glpat-|hf_[A-Za-z]|sk-|xox[abp]-|AKIA")
+
+
+def _trim(path: str, seg_re: str):
+    """Cut a path after its first segment matching seg_re ($WORK/code/repo -> $WORK/code)."""
+    parts = path.rstrip("/").split("/")
+    for i, p in enumerate(parts[1:], 1):
+        if re.search(seg_re, p, re.I):
+            return "/".join(parts[:i + 1])
+    return None
+
+
+def _roots(section: str, path: str, only=None):
+    out = []
+    for key, seg in (("code_root", CODE_SEG), ("results_root", RES_SEG)):
+        v = _trim(path, seg) if only in (None, key) else None
+        if v:
+            out.append((f"{section}.{key}", v))
+    return out
+
+
+def _abs_path(m):
+    p = m[1]
+    if p.startswith("/lustre"):
+        return _roots("jeanzay", p)
+    return _roots("oar", p) + _roots("lab_server", p, only="results_root")
+
+
+def _oar_l(m):
+    res, _, wall = m[1].partition(",walltime=")
+    return [("oar.resources", res)] + ([("oar.walltime", wall)] if wall else [])
+
+
+def _gpu_of(qos: str) -> str:
+    return "a100" if "a100" in qos else "h100" if "h100" in qos else "v100"
+
+
+OAR_CMD = r"(?:#OAR|\boarsub\b[^\n]*?)"
+SUGGEST_RULES = [(re.compile(p, re.M), fn) for p, fn in [
+    (r"(?:--account[= ]|-A\s*)([A-Za-z0-9]{2,16})@(?:v100|a100|h100)\b",
+     lambda m: [("jeanzay.account", m[1])]),
+    (r"--qos[= ](qos_gpu[\w-]*)", lambda m: [(f"jeanzay.gpus.{_gpu_of(m[1])}.qos", m[1])]),
+    (r"\b([a-z][a-z0-9_]{1,15})@jean-?zay", lambda m: [("jeanzay.login", m[1])]),
+    (r"^\s*module load\s+([\w./+-]+)", lambda m: [("jeanzay.modules", f"module load {m[1]}")]),
+    (r"(\$(?:WORK|SCRATCH|STORE)(?:/[\w.-]+)+)", lambda m: _roots("jeanzay", m[1])),
+    (OAR_CMD + r"\s-l\s+[\"']?([^\s\"']+)", _oar_l),
+    (OAR_CMD + r"\s-q\s+(\w+)", lambda m: [("oar.queue", m[1])]),
+    (OAR_CMD + r"\s-p\s+(\"[^\"\n]+\"|'[^'\n]+'|\S+)",
+     lambda m: [("oar.gpu_property", m[1][1:-1] if m[1][0] in "\"'" else m[1])]),
+    (r"\bssh\s+(?:-\S+\s+)*(?:[\w.-]+@)?([\w.-]*(?:front|oar|access)[\w.-]*)",
+     lambda m: [("oar.frontend", m[1])]),
+    (r"\b((?:micro)?(?:conda|mamba)) activate\s+([\w.-]+)",
+     lambda m: [("lab_server.python_env", f"{m[1]} activate {m[2]}")]),
+    (r"\bsource\s+([~\w./$-]+/bin/activate)\b",
+     lambda m: [("lab_server.python_env", f"source {m[1]}")]),
+    (r"\brsync\b[^\n]*?\s[\w.@-]+:\S+\s+(/[\w./-]+)",
+     lambda m: _roots("lab_server", m[1], only="results_root")),
+    (r"(?<![\w$/])(/(?:data|scratch|home|mnt|srv|nfs|work|storage|lustre)\w*(?:/[\w.-]+)+)",
+     _abs_path),
+]]
+
+
+def _plausible(v: str) -> bool:
+    if not v or len(v) > 120 or "TODO" in v or "{{" in v or "<" in v or SECRET_RE.search(v):
+        return False
+    # long random-looking chunks are probably tokens
+    return not any(len(t) >= 32 and re.search(r"\d", t) and re.search(r"[a-z]", t)
+                   and re.search(r"[A-Z]", t) for t in re.split(r"[/=:@ ]", v))
+
+
+def _launch_files(root: Path, limit: int = 5000):
+    n = 0
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP_DIRS]
+        for name in files:
+            f = Path(d) / name
+            if f.suffix in LAUNCH_SUFFIXES and f.stat().st_size < 1_000_000:
+                yield f
+                n += 1
+                if n >= limit:
+                    return
+
+
+def _json_strings(o):
+    if isinstance(o, str):
+        yield o
+    elif isinstance(o, dict):
+        for v in o.values():
+            yield from _json_strings(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _json_strings(v)
+
+
+def _jsonl_texts(f: Path, label: str):
+    with f.open(errors="replace") as fh:
+        for line in fh:
+            try:
+                strings = list(_json_strings(json.loads(line)))
+            except json.JSONDecodeError:
+                continue
+            # skip kit templates and compute.yaml itself: their examples aren't evidence
+            yield label, "\n".join(s for s in strings
+                                   if "{{" not in s and "Settings for THIS machine" not in s)
+
+
+def suggest_sources(hub):
+    """(label, text) for every place that may contain compute settings."""
+    repos = hub / "repos" if hub else None
+    for link in sorted(repos.iterdir()) if repos and repos.is_dir() else []:
+        if link.is_symlink() and link.exists():
+            root = link.resolve()
+            for f in _launch_files(root):
+                yield f"repos/{link.name}/{f.relative_to(root).as_posix()}", f.read_text(errors="replace")
+    claude = Path.home() / ".claude"
+    if (claude / "projects").is_dir():
+        for f in sorted((claude / "projects").rglob("*.jsonl")):
+            yield from _jsonl_texts(f, "claude transcripts")
+    if (claude / "history.jsonl").is_file():
+        yield from _jsonl_texts(claude / "history.jsonl", "claude prompt history")
+    for name in (".bash_history", ".zsh_history"):
+        f = Path.home() / name
+        if f.is_file():
+            yield "shell history", f.read_text(errors="replace")
+
+
+def suggest_probes(hub):
+    """(key, value, label) from looking at this machine."""
+    gpu = False
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=15)
+            gpu = r.returncode == 0 and "GPU" in r.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    yield "lab_server.smoke_test", "gpu" if gpu else "cpu", "nvidia-smi" if gpu else "no GPU visible"
+    if shutil.which("oarsub"):
+        yield "oar.frontend", "local", "oarsub on this machine"
+    env = os.environ.get("CONDA_DEFAULT_ENV")
+    if env and env != "base":
+        yield "lab_server.python_env", f"conda activate {env}", "current shell"
+    repos = hub / "repos" if hub else None
+    links = [l for l in repos.iterdir() if l.is_symlink() and l.exists()] if repos and repos.is_dir() else []
+    for parent in sorted({str(l.resolve().parent) for l in links}):
+        yield "oar.code_root", parent, "parent of linked repos"
+
+
+def cmd_suggest_compute(a):
+    hub = find_hub(required=False)
+    comp = hub / COMPUTE if hub else None
+    todo = compute_placeholders(comp.read_text(encoding="utf-8")) if comp and comp.exists() else set()
+    found = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    for label, text in suggest_sources(hub):
+        for rx, fn in SUGGEST_RULES:
+            for m in rx.finditer(text):
+                for key, value in fn(m):
+                    value = value.strip()
+                    if _plausible(value):
+                        found[key][value][label] += 1
+    for key, value, label in suggest_probes(hub):
+        found[key][value][label] += 1
+    keys = []
+    for key in COMPUTE_KEYS:
+        cands = sorted(found[key].items(), key=lambda kv: -sum(kv[1].values()))[:a.top]
+        if cands or key in todo:
+            keys.append({"key": key, "placeholder": key in todo,
+                         "candidates": [{"value": v, "count": sum(c.values()),
+                                         "sources": c.most_common()} for v, c in cands]})
+    if a.json:
+        print(json.dumps({"compute_yaml": str(comp) if comp else None, "keys": keys}, indent=2))
+        return
+    print(f"Suggestions for {comp or COMPUTE} (values found on this machine; confirm before use)\n")
+    for k in keys:
+        print(f"{k['key']}  [{'TODO' if k['placeholder'] else 'set'}]")
+        if not k["candidates"]:
+            print("    no evidence found")
+        for c in k["candidates"]:
+            src = ", ".join(f"{n}x {l}" for l, n in c["sources"][:3])
+            more = f", +{len(c['sources']) - 3} more" if len(c["sources"]) > 3 else ""
+            print(f"    {c['value']:<40} {src}{more}")
 
 
 # -------------------------------------------------------------------- main
@@ -666,6 +1118,17 @@ def main():
 
     s = sub.add_parser("doctor", help="check the installation")
     s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("update", help="pull the kit, re-link skills, merge kit changes into hub files")
+    s.add_argument("--no-pull", action="store_true", help="skip `git pull` (kit already updated)")
+    s.add_argument("--dry-run", action="store_true", help="show what would change; no pull, no writes")
+    s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("suggest-compute",
+                       help="suggest compute.yaml values found in repo scripts, histories, transcripts")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--top", type=int, default=3, help="candidates per key (default 3)")
+    s.set_defaults(fn=cmd_suggest_compute)
 
     a = p.parse_args()
     a.fn(a)

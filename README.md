@@ -23,8 +23,9 @@ cd ~/tools/research-kit
 ./install.sh --hub ~/research-hub
 rh doctor
 ```
-Then follow [docs/SETUP.md](docs/SETUP.md) to fill `compute.yaml` and start the
-always-on Remote Control server.
+Then follow [docs/SETUP.md](docs/SETUP.md) to fill `compute.yaml` (`/rh-setup-compute`
+suggests values already used on the machine) and start the always-on Remote
+Control server.
 
 ## Skills
 | Skill | Does |
@@ -41,6 +42,8 @@ always-on Remote Control server.
 | `/rh-run-guide` | OAR + Jean Zay scripts and a step-by-step launch guide (you launch) |
 | `/rh-results` | Results → tables, figures, verdicts vs. success criteria |
 | `/rh-brief` | Draft for the next supervisor meeting |
+| `/rh-setup-compute` | Fill `compute.yaml` from values found on the machine; you confirm each |
+| `/rh-update` | Update the kit and merge template changes into your hub |
 
 You can also just talk normally ("here are today's notes", "resume project X");
 skills trigger from their descriptions.
@@ -65,8 +68,21 @@ docs/SETUP.md           step-by-step setup, SSH notes, troubleshooting
 ```
 
 ## Updating
-`cd ~/tools/research-kit && git pull && ./install.sh` — skills are symlinked,
-so edits to the kit apply to every session immediately.
+On a machine where the kit is already installed:
+```bash
+rh update            # or --dry-run to preview
+```
+It pulls the kit (fast-forward only), re-links skills (new ones added, removed
+ones dropped), and merges kit changes into your hub's `CLAUDE.md`,
+`.claude/settings.json`, `hub.sh` and `compute.yaml` while keeping your edits.
+A file it can't merge is left as is, with the kit's version next to it as
+`<file>.kit-new` (ask Claude: `/rh-update`). It never commits the hub.
+
+Installed before `rh update` existed? Once: `cd ~/tools/research-kit && git pull
+&& rh update --no-pull`; afterwards `rh update` is enough.
+
+`compute.yaml` is private: the hub git-ignores it, and `rh update` untracks it
+in hubs created before that change.
 
 ## Later: automating experiment launch on compute nodes
 Launch scripts are already generated per block. Automating submission later

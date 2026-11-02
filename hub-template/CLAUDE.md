@@ -19,7 +19,8 @@ linked (symlinks) under `repos/`.
   - `reports/`: meeting briefs
 - `repos/<name>`: symlinks to the real code bases
 - `worktrees/<repo>/<branch>`: git worktrees, where all coding happens
-- `compute.yaml`: this machine's OAR / Jean Zay settings (no secrets)
+- `compute.yaml`: this machine's OAR / Jean Zay settings (no secrets). Private and
+  git-ignored: never commit, push or quote it outside this machine.
 
 ## Workflow
 meeting → plan → design → implement → run guide → *I launch jobs* → results → brief
@@ -35,6 +36,8 @@ meeting → plan → design → implement → run guide → *I launch jobs* → 
 | Meeting brief | /rh-brief | I edit |
 | Overview / resume | /rh-status, /rh-resume | — |
 | Projects & repos | /rh-new-project, /rh-import-project, /rh-link-repo | — |
+| Fill compute.yaml | /rh-setup-compute | I confirm each value |
+| Update the kit | /rh-update | I review and commit |
 
 Never skip a gate unless I explicitly say so for that plan.
 
@@ -49,7 +52,8 @@ Use `rh` for every mechanical step instead of doing it by hand:
 `rh clone-repo <url> <dest> [--project P]`, `rh attach <project> <repo>`,
 `rh new-project <name>`, `rh new-meeting <project>`, `rh new-plan <project> "<title>"`,
 `rh set-status <plan> <status>`, `rh set-block <plan> <B01> --status … --branch …`,
-`rh worktree add|list|remove <repo> <branch>`, `rh paths`, `rh doctor`.
+`rh worktree add|list|remove <repo> <branch>`, `rh paths`, `rh doctor`,
+`rh update [--dry-run]`, `rh suggest-compute [--json]`.
 Templates live in the kit: `rh paths` shows where.
 
 ## Rules

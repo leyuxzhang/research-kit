@@ -1,40 +1,131 @@
 # Settings for THIS machine, used to fill launch scripts and run guides.
-# No passwords, tokens or keys here — ever.
-# Replace every TODO. `rh doctor` counts the ones left.
+# No passwords, tokens or keys here — ever. This file is private: it is
+# git-ignored and never leaves this machine.
+# Replace every placeholder value; `rh doctor` counts the ones left.
+# Values already used on this machine: `rh suggest-compute`, or ask Claude
+# to run /rh-setup-compute (it asks you to confirm each one).
+#
+# Each key is documented as:   <type> — what it is / where it's used.
+# Types used below:
+#   path         absolute directory path, no trailing slash. Shell variables
+#                ($WORK, $HOME) are fine where noted: they are expanded on the
+#                cluster when the job runs.
+#   command      one shell command line.
+#   shell block  several shell lines (YAML `|` block, indented under the key),
+#                pasted verbatim into the job script.
+#   string       free text; quote it if it contains : # ' " or starts with $ /.
+#   duration     "HH:MM:SS", quoted.
+#   a | b        exactly one of the listed values.
 
+# ---------------------------------------------------------------- lab server
+# This machine (where the hub lives and Claude runs quick tests).
 lab_server:
-  results_root: TODO            # where you copy results back, e.g. /data/me/results
-  smoke_test: cpu               # cpu | gpu — can quick tests use a GPU on this machine?
-  python_env: TODO              # how to activate the env for tests, e.g. "conda activate nlp"
+  # path on this machine — where you copy finished runs back to (the rsync
+  # target in run guides). Runs land in <results_root>/<project>/<plan-id>/<block>/.
+  #   e.g. /data/jdoe/results
+  results_root: TODO
 
+  # cpu | gpu — whether quick smoke tests may use a GPU on this machine.
+  smoke_test: cpu
+
+  # command — activates the Python env used for tests on this machine.
+  #   e.g. conda activate nlp     or   source ~/venvs/nlp/bin/activate
+  python_env: TODO
+
+# ----------------------------------------------------------------------- OAR
 oar:
-  frontend: TODO                # host where you run oarsub ("local" if it's this machine)
-  code_root: TODO               # where the repos are, as seen from OAR nodes
-  results_root: TODO            # where OAR jobs write outputs
+  # string — hostname of the OAR frontend (where you run oarsub), as you'd
+  # type it after `ssh`; or `local` if it is this machine. Only shown in guides.
+  #   e.g. oar-frontend.mylab.fr
+  frontend: TODO
+
+  # path as seen from OAR nodes — directory holding one clone per repo, named
+  # like the links under repos/ (guides do `cd <code_root>/<repo>`).
+  #   e.g. /home/jdoe/code
+  code_root: TODO
+
+  # path as seen from OAR nodes, writable by jobs — where jobs write outputs:
+  # <results_root>/<project>/<plan-id>/<block>/<run>.
+  #   e.g. /scratch/jdoe/results
+  results_root: TODO
+
+  # string — OAR queue name passed to `#OAR -q`. `default` unless your site
+  # has dedicated queues (e.g. besteffort).
   queue: default
-  resources: "/nodes=1/gpu=1"   # check your site's syntax (some use host=1/gpu=1)
-  gpu_property: ""              # e.g. "gpu_model='A100'" — empty for any GPU
+
+  # string — OAR resource request passed to `#OAR -l`, WITHOUT walltime
+  # (added from `walltime` below). Syntax is site-specific.
+  #   e.g. "/nodes=1/gpu=1"   or   "host=1/gpu=1"
+  resources: "/nodes=1/gpu=1"
+
+  # string — OAR property filter passed to `#OAR -p` (SQL-like expression on
+  # node properties; list them with `oarnodes`). "" = no filter, any GPU.
+  #   e.g. "gpu_model='A100'"
+  gpu_property: ""
+
+  # duration — default job time limit, must fit the queue's maximum.
   walltime: "12:00:00"
+
+  # shell block — run on the node right after `cd <code_root>/<repo>`; must
+  # activate the Python env the job uses.
   env_setup: |
     # TODO, e.g.:
     # source ~/miniconda3/etc/profile.d/conda.sh
     # conda activate nlp
 
+# ------------------------------------------------------------ Jean Zay (Slurm)
 jeanzay:
-  login: TODO                   # your login (only shown in printed commands)
-  account: TODO                 # project id, e.g. abc  → abc@a100
-  default_gpu: a100             # v100 | a100 | h100
-  gpus: # verify qos names and cpus per GPU in the IDRIS documentation
+  # string — your Jean Zay username. Only shown in printed commands (ssh, rsync).
+  #   e.g. ujd12ab
+  login: TODO
+
+  # string — your project id, WITHOUT the @<gpu> suffix (the script builds
+  # --account=<account>@<account_suffix>). Shown by `idrproj` on Jean Zay.
+  #   e.g. abc
+  account: TODO
+
+  # v100 | a100 | h100 — GPU type used when the plan doesn't specify one.
+  # Must be a key under `gpus` below.
+  default_gpu: a100
+
+  # One entry per GPU partition. Fields:
+  #   account_suffix  string  — part after @ in --account (abc@a100).
+  #   constraint      string  — value for `#SBATCH -C`.
+  #   qos             string  — Slurm QoS for `#SBATCH --qos`; it sets the max
+  #                             walltime, e.g. qos_gpu-t3 (v100),
+  #                             qos_gpu_a100-t3, qos_gpu_h100-t3.
+  #   cpus_per_gpu    integer — CPU cores reserved per GPU (--cpus-per-task).
+  # Verify all of these in the IDRIS documentation for your allocation.
+  gpus:
     v100: {account_suffix: v100, constraint: v100-32g, qos: TODO, cpus_per_gpu: 10}
     a100: {account_suffix: a100, constraint: a100,     qos: TODO, cpus_per_gpu: 8}
     h100: {account_suffix: h100, constraint: h100,     qos: TODO, cpus_per_gpu: 24}
+
+  # duration — default job time limit, must fit the chosen QoS maximum.
   walltime: "20:00:00"
-  code_root: TODO               # e.g. $WORK/code
-  results_root: TODO            # e.g. $WORK/results (or $SCRATCH/…)
+
+  # path on Jean Zay ($WORK etc. allowed) — directory holding one clone per
+  # repo, named like the links under repos/.
+  #   e.g. $WORK/code
+  code_root: TODO
+
+  # path on Jean Zay ($WORK / $SCRATCH allowed) — where jobs write outputs:
+  # <results_root>/<project>/<plan-id>/<block>/<run>.
+  #   e.g. $WORK/results   or   $SCRATCH/results
+  results_root: TODO
+
+  # shell block — `module` commands run first in every job script.
+  # List available versions with `module avail pytorch` on a login node.
   modules: |
     module purge
     # TODO, e.g. module load pytorch-gpu/py3/<version>
+
+  # shell block — extra setup run after `modules` (e.g. activating a venv on
+  # top of the module). "" if the module is enough.
   env_setup: ""
+
+  # shell block — exports that force offline mode (compute nodes have no
+  # internet). Keep unless you know you don't need them.
   offline_env: |
     export HF_HUB_OFFLINE=1
     export HF_DATASETS_OFFLINE=1
