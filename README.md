@@ -68,7 +68,7 @@ docs/SETUP.md           step-by-step setup, SSH notes, troubleshooting
 `cd ~/tools/research-kit && git pull && ./install.sh` — skills are symlinked,
 so edits to the kit apply to every session immediately.
 
-## Later: automating Jean Zay
+## Later: automating experiment launch on compute nodes
 Launch scripts are already generated per block. Automating submission later
 means adding a submit/monitor command to `rh` that runs these same scripts and
 removing `sbatch`/`ssh` from the hub's deny-rules. Nothing else changes.
