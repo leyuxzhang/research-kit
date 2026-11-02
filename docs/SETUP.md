@@ -128,7 +128,13 @@ rh update            # pull the kit, re-link skills, merge into hub files
 rh update --dry-run  # preview only
 ```
 Kit installed before `rh update` existed: run once
-`cd ~/tools/research-kit && git pull && rh update --no-pull`.
+```bash
+cd ~/tools/research-kit
+git -c core.fileMode=false pull     # ignore `chmod +x` done on the scripts
+python3 bin/rh update --no-pull
+```
+(A plain `git pull` refuses there, because the scripts were made executable
+locally with `chmod +x`.)
 
 Your edits to the hub's `CLAUDE.md`, `settings.json`, `hub.sh` and
 `compute.yaml` are kept: kit changes are merged in. If a file can't be merged

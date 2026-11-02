@@ -78,8 +78,14 @@ ones dropped), and merges kit changes into your hub's `CLAUDE.md`,
 A file it can't merge is left as is, with the kit's version next to it as
 `<file>.kit-new` (ask Claude: `/rh-update`). It never commits the hub.
 
-Installed before `rh update` existed? Once: `cd ~/tools/research-kit && git pull
-&& rh update --no-pull`; afterwards `rh update` is enough.
+Installed before `rh update` existed? Run once:
+```bash
+cd ~/tools/research-kit
+git -c core.fileMode=false pull     # ignore `chmod +x` done on the scripts
+python3 bin/rh update --no-pull
+```
+Afterwards `rh update` is enough. It ignores permission changes on the kit's
+files (`chmod +x`), and `install.sh` restores them after each update.
 
 `compute.yaml` is private: the hub git-ignores it, and `rh update` untracks it
 in hubs created before that change.

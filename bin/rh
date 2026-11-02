@@ -793,11 +793,14 @@ def cmd_update(a):
     elif not a.no_pull:
         if not (KIT_DIR / ".git").exists():
             die(f"{KIT_DIR} is not a git clone: update it yourself, then run `rh update --no-pull`")
-        if git(KIT_DIR, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        # Permission bits don't count as local changes (people `chmod +x` scripts;
+        # install.sh does it too, and re-runs right after the pull).
+        no_mode = ["-c", "core.fileMode=false"]
+        if git(KIT_DIR, *no_mode, "status", "--porcelain", "--untracked-files=no").stdout.strip():
             die(f"the kit at {KIT_DIR} has local changes; commit or stash them first")
         old = kit_head()
         print(f"Pulling the kit in {KIT_DIR}")
-        if subprocess.run(["git", "-C", str(KIT_DIR), "pull", "--ff-only"]).returncode != 0:
+        if subprocess.run(["git", "-C", str(KIT_DIR), *no_mode, "pull", "--ff-only"]).returncode != 0:
             die("git pull failed (see above); nothing else was changed")
         if kit_head() != old:  # finish with the freshly pulled rh
             os.execv(sys.executable, [sys.executable, str(KIT_DIR / "bin" / "rh"), "update", "--no-pull"])
