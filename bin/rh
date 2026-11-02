@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""
+rh — deterministic helper for the research hub.
+
+Claude's skills call this tool for every mechanical step (linking repos,
+creating project / meeting / plan files, worktrees, statuses) so these steps
+behave the same way every time. Standard library only, Python >= 3.8.
+
+Run `rh -h` or `rh <command> -h` for help.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+KIT_DIR = Path(__file__).resolve().parent.parent
+TEMPLATES = KIT_DIR / "templates"
+HUB_TEMPLATE = KIT_DIR / "hub-template"
+CONFIG_FILE = (
+    Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    / "research-kit"
+    / "config.json"
+)
+MARKER = ".research-hub"
+
+PLAN_STATUSES = [
+    "draft", "approved", "designed", "implementing", "implemented",
+    "guide-ready", "running", "results-ingested", "done", "abandoned",
+]
+BLOCK_STATUSES = [
+    "planned", "designed", "implementing", "implemented", "blocked",
+    "guide-ready", "running", "results-in", "dropped",
+]
+NEXT_STEP = {
+    "draft": "waiting on you: approve the plan (/rh-plan)",
+    "approved": "next: /rh-design",
+    "designed": "next: /rh-implement (can run unattended)",
+    "implementing": "in progress (or interrupted: /rh-implement resumes)",
+    "implemented": "waiting on you: review branches, then /rh-run-guide",
+    "guide-ready": "waiting on you: launch the jobs (see guides/)",
+    "running": "waiting on you: copy results back, then /rh-results",
+    "results-ingested": "next: /rh-brief, or a new meeting",
+    "done": "",
+    "abandoned": "",
+}
+
+GIT_ENV = dict(
+    os.environ,
+    GIT_TERMINAL_PROMPT="0",
+    GIT_SSH_COMMAND=os.environ.get("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"),
+)
+
+
+# ----------------------------------------------------------------- helpers
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def die(msg: str) -> None:
+    print(f"rh: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def slugify(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s.strip().lower()).strip("-")
+    return s or "untitled"
+
+
+def safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s.strip()).strip("-") or "repo"
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def find_hub(required: bool = True):
+    env = os.environ.get("RH_HUB")
+    if env:
+        p = Path(env).expanduser()
+        if (p / MARKER).exists():
+            return p.resolve()
+        die(f"RH_HUB={env} is not a research hub (no {MARKER} file)")
+    try:
+        cwd = Path.cwd()
+    except FileNotFoundError:  # current directory was deleted (e.g. a removed worktree)
+        cwd = None
+    for d in ([cwd, *cwd.parents] if cwd else []):
+        if (d / MARKER).exists():
+            return d.resolve()
+    hub = load_config().get("hub")
+    if hub and (Path(hub) / MARKER).exists():
+        return Path(hub).resolve()
+    if required:
+        die("no research hub found. Run `rh init-hub <path>` or set RH_HUB.")
+    return None
+
+
+def render(template: str, **kw) -> str:
+    text = (TEMPLATES / template).read_text()
+    for k, v in kw.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    return text
+
+
+def git(repo, *args, check=True):
+    r = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, env=GIT_ENV
+    )
+    if check and r.returncode != 0:
+        die(f"git {' '.join(args)} failed in {repo}:\n{r.stderr.strip()}")
+    return r
+
+
+def settings_local(hub: Path) -> Path:
+    return hub / ".claude" / "settings.local.json"
+
+
+def update_allowed_dirs(hub: Path, add=None, remove=None) -> None:
+    """additionalDirectories lets Claude work in linked repos without prompting.
+    Stored in settings.local.json because paths are machine-specific."""
+    f = settings_local(hub)
+    data = {}
+    if f.exists():
+        try:
+            data = json.loads(f.read_text())
+        except json.JSONDecodeError:
+            die(f"{f} is not valid JSON; fix it by hand first")
+    dirs = data.setdefault("permissions", {}).setdefault("additionalDirectories", [])
+    if add and add not in dirs:
+        dirs.append(add)
+    if remove and remove in dirs:
+        dirs.remove(remove)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def allowed_dirs(hub: Path) -> list:
+    try:
+        return json.loads(settings_local(hub).read_text())["permissions"]["additionalDirectories"]
+    except Exception:
+        return []
+
+
+def project_dir(hub: Path, name: str) -> Path:
+    for cand in (name, slugify(name)):
+        p = hub / "projects" / cand
+        if p.is_dir():
+            return p
+    existing = sorted(d.name for d in (hub / "projects").glob("*") if d.is_dir())
+    die(f"project '{name}' not found. Existing: {', '.join(existing) or 'none'}")
+
+
+def repo_real(hub: Path, repo: str) -> Path:
+    link = hub / "repos" / repo
+    if not link.is_symlink() or not link.exists():
+        die(f"repos/{repo} is missing or broken; see `rh repos`")
+    return link.resolve()
+
+
+FM_RE = re.compile(r"\A---\n(.*?)\n---\n", re.S)
+
+
+def read_fm(text: str):
+    m = FM_RE.match(text)
+    if not m:
+        return {}, text
+    d = {}
+    for line in m.group(1).splitlines():
+        if ":" in line and not line.startswith((" ", "#")):
+            k, v = line.split(":", 1)
+            d[k.strip()] = v.split("#")[0].strip()
+    return d, text[m.end():]
+
+
+def set_fm(text: str, **updates) -> str:
+    m = FM_RE.match(text)
+    if not m:
+        die("file has no front-matter")
+    lines = m.group(1).splitlines()
+    for k, v in updates.items():
+        for i, line in enumerate(lines):
+            if re.match(rf"^{re.escape(k)}\s*:", line):
+                lines[i] = f"{k}: {v}"
+                break
+        else:
+            lines.append(f"{k}: {v}")
+    return "---\n" + "\n".join(lines) + "\n---\n" + text[m.end():]
+
+
+def resolve_plan(hub: Path, ref: str) -> Path:
+    p = Path(ref).expanduser()
+    if p.is_file():
+        return p.resolve()
+    if p.is_dir() and (p / "plan.md").exists():
+        return (p / "plan.md").resolve()
+    if "/" in ref:
+        proj, pid = ref.split("/", 1)
+        f = project_dir(hub, proj) / "plans" / pid / "plan.md"
+        if f.exists():
+            return f
+    hits = list((hub / "projects").glob(f"*/plans/{ref}/plan.md"))
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        die(f"plan id '{ref}' is ambiguous; use <project>/<plan-id>")
+    die(f"plan '{ref}' not found")
+
+
+def table_rows(text: str):
+    """Rows of the '| Block | ...' status table as dicts."""
+    lines = text.split("\n")
+    hdr = next((i for i, l in enumerate(lines) if re.match(r"^\|\s*Block\s*\|", l)), None)
+    if hdr is None:
+        return [], None, None, None
+    headers = [c.strip().lower() for c in lines[hdr].strip().strip("|").split("|")]
+    rows, i = [], hdr + 2
+    while i < len(lines) and lines[i].startswith("|"):
+        cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+        cells += [""] * (len(headers) - len(cells))
+        rows.append((i, dict(zip(headers, cells))))
+        i += 1
+    return rows, headers, hdr, i
+
+
+# ---------------------------------------------------------------- commands
+def cmd_init_hub(a):
+    path = Path(a.path).expanduser().resolve()
+    if (path / MARKER).exists():
+        print(f"Hub already exists at {path}")
+    else:
+        if path.exists() and any(path.iterdir()) and not a.force:
+            die(f"{path} exists and is not empty (use --force to add hub files into it)")
+        shutil.copytree(HUB_TEMPLATE, path, dirs_exist_ok=True)
+        (path / MARKER).write_text(f"created: {today()}\nkit: {KIT_DIR}\n")
+        for d in ("projects", "repos", "worktrees"):
+            (path / d).mkdir(exist_ok=True)
+        (path / "hub.sh").chmod(0o755)
+        if not (path / ".git").exists():
+            subprocess.run(["git", "init", "-q", str(path)], check=False)
+            subprocess.run(["git", "-C", str(path), "add", "-A"], check=False)
+            subprocess.run(["git", "-C", str(path), "commit", "-q", "-m",
+                            "Initialize research hub"], check=False)
+        print(f"Created hub at {path}")
+    cfg = load_config()
+    cfg["hub"] = str(path)
+    save_config(cfg)
+    print("Next: edit compute.yaml, then start the Remote Control server (see docs/SETUP.md).")
+
+
+def do_link(hub: Path, real: Path, name, project=None, role=""):
+    r = subprocess.run(["git", "-C", str(real), "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"{real} is not inside a git repository")
+    top = Path(r.stdout.strip()).resolve()
+    if top != real:
+        print(f"note: {real} is inside repo {top}; linking the repo root instead")
+        real = top
+    name = safe_name(name or real.name)
+    link = hub / "repos" / name
+    link.parent.mkdir(exist_ok=True)
+    if link.is_symlink() or link.exists():
+        if link.is_symlink() and link.resolve() == real:
+            print(f"repos/{name} already links to {real}")
+        else:
+            die(f"repos/{name} already exists and points elsewhere; choose another --name")
+    else:
+        os.symlink(real, link)
+        print(f"Linked repos/{name} -> {real}  (nothing was moved or modified)")
+    update_allowed_dirs(hub, add=str(real))
+    if project:
+        attach(hub, project, name, role)
+    return name
+
+
+def cmd_link_repo(a):
+    hub = find_hub()
+    real = Path(a.path).expanduser().resolve()
+    if not real.is_dir():
+        die(f"{real} is not a directory")
+    do_link(hub, real, a.name, a.project, a.role or "")
+
+
+def cmd_clone_repo(a):
+    hub = find_hub()
+    base = re.sub(r"\.git$", "", a.url.rstrip("/").split("/")[-1].split(":")[-1])
+    dest = Path(a.dest).expanduser()
+    target = (dest / base) if dest.is_dir() else dest
+    if target.exists():
+        die(f"{target} already exists. If it is already a clone: rh link-repo {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["git", "clone", a.url, str(target)], capture_output=True,
+                       text=True, env=GIT_ENV)
+    if r.returncode != 0:
+        die("git clone failed. If it needs a password or token, run the clone yourself "
+            f"in a terminal, then `rh link-repo <path>`.\n{r.stderr.strip()}")
+    print(f"Cloned into {target}")
+    do_link(hub, target.resolve(), a.name or base, a.project, a.role or "")
+
+
+def cmd_unlink_repo(a):
+    hub = find_hub()
+    link = hub / "repos" / a.name
+    if not link.is_symlink():
+        die(f"repos/{a.name} is not a link")
+    real = str(Path(os.readlink(link)).resolve()) if link.exists() else os.readlink(link)
+    link.unlink()
+    still_used = any(l.is_symlink() and str(l.resolve()) == real
+                     for l in (hub / "repos").iterdir())
+    if not still_used:
+        update_allowed_dirs(hub, remove=real)
+    print(f"Removed link repos/{a.name}. The code at {real} is untouched.")
+
+
+def cmd_repos(a):
+    hub = find_hub()
+    links = sorted((hub / "repos").iterdir()) if (hub / "repos").exists() else []
+    if not links:
+        print("No repos linked yet. Use `rh link-repo <path>` or `rh clone-repo <url> <dest>`.")
+    for link in links:
+        if not link.is_symlink():
+            continue
+        ok = link.exists()
+        branch = git(link, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() if ok else "-"
+        dirty = ok and bool(git(link, "status", "--porcelain", check=False).stdout.strip())
+        print(f"{link.name:28} {'OK    ' if ok else 'BROKEN'} {branch:24} "
+              f"{'dirty' if dirty else '     '}  -> {os.readlink(link)}")
+
+
+def attach(hub: Path, project: str, repo: str, role: str = ""):
+    pdir = project_dir(hub, project)
+    if not (hub / "repos" / repo).exists():
+        die(f"repos/{repo} not found; link it first")
+    y = pdir / "project.yaml"
+    text = y.read_text()
+    if re.search(rf"^\s*-\s*name:\s*{re.escape(repo)}\s*$", text, re.M):
+        print(f"{repo} is already attached to {pdir.name}")
+        return
+    if not text.endswith("\n"):
+        text += "\n"
+    text += f"  - name: {repo}\n    role: {json.dumps(role)}\n"
+    y.write_text(text)
+    print(f"Attached repos/{repo} to project {pdir.name}")
+
+
+def cmd_attach(a):
+    attach(find_hub(), a.project, a.repo, a.role or "")
+
+
+def cmd_new_project(a):
+    hub = find_hub()
+    name = slugify(a.name)
+    pdir = hub / "projects" / name
+    if pdir.exists():
+        die(f"project {name} already exists")
+    for d in ("meetings", "plans", "guides", "results", "reports", "analysis", "codebase"):
+        (pdir / d).mkdir(parents=True)
+    goal = a.goal or "TODO"
+    (pdir / "project.yaml").write_text(
+        render("project.yaml", name=name, date=today(), goal=json.dumps(goal)))
+    (pdir / "project.md").write_text(render("project.md", title=a.name, goal=goal))
+    for repo in a.repos or []:
+        attach(hub, name, repo)
+    print(pdir)
+
+
+def cmd_new_meeting(a):
+    hub = find_hub()
+    pdir = project_dir(hub, a.project)
+    date = a.date or today()
+    base = f"{date}-{slugify(a.slug)}" if a.slug else date
+    f, i = pdir / "meetings" / f"{base}.md", 2
+    while f.exists():
+        f, i = pdir / "meetings" / f"{base}-{i}.md", i + 1
+    f.write_text(render("meeting.md", project=pdir.name, date=date))
+    print(f)
+
+
+def cmd_new_plan(a):
+    hub = find_hub()
+    pdir = project_dir(hub, a.project)
+    pid = f"{today()}-{slugify(a.slug or a.title)}"
+    d = pdir / "plans" / pid
+    if d.exists():
+        die(f"plan {pid} already exists")
+    (d / "impl").mkdir(parents=True)
+    (d / "plan.md").write_text(
+        render("plan.md", id=pid, project=pdir.name, title=a.title, date=today()))
+    print(d / "plan.md")
+
+
+def cmd_set_status(a):
+    hub = find_hub()
+    if a.status not in PLAN_STATUSES:
+        die(f"status must be one of: {', '.join(PLAN_STATUSES)}")
+    f = resolve_plan(hub, a.plan)
+    f.write_text(set_fm(f.read_text(), status=a.status, updated=today()))
+    print(f"{f.parent.name}: status -> {a.status}")
+
+
+def cmd_set_block(a):
+    hub = find_hub()
+    if a.status and a.status not in BLOCK_STATUSES:
+        die(f"block status must be one of: {', '.join(BLOCK_STATUSES)}")
+    f = resolve_plan(hub, a.plan)
+    text = f.read_text()
+    rows, headers, hdr, end = table_rows(text)
+    if headers is None:
+        die("no '| Block | ...' table found in plan.md")
+    fields = {"status": a.status, "repos": a.repos, "branch": a.branch,
+              "guide": a.guide, "results": a.results, "notes": a.notes}
+    lines = text.split("\n")
+    row = next(((i, r) for i, r in rows if r.get("block") == a.block), None)
+    if row is None:
+        cells = {h: "" for h in headers}
+        cells["block"] = a.block
+        lines.insert(end, "")
+        idx = end
+    else:
+        idx, cells = row
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if k not in headers:
+            die(f"column '{k}' not in status table ({', '.join(headers)})")
+        cells[k] = v.replace("|", "/")
+    lines[idx] = "| " + " | ".join(cells.get(h, "") for h in headers) + " |"
+    f.write_text(set_fm("\n".join(lines), updated=today()))
+    print(f"{f.parent.name} {a.block}: " + ", ".join(f"{k}={v}" for k, v in fields.items() if v))
+
+
+def cmd_status(a):
+    hub = find_hub()
+    pdirs = ([project_dir(hub, a.project)] if a.project else
+             sorted(d for d in (hub / "projects").glob("*") if d.is_dir()))
+    if not pdirs:
+        print("No projects yet. Start one with /rh-new-project or /rh-import-project.")
+        return
+    for pdir in pdirs:
+        y = (pdir / "project.yaml").read_text() if (pdir / "project.yaml").exists() else ""
+        goal = (re.search(r"^goal:\s*(.*)$", y, re.M) or [None, ""])[1].strip('"')
+        pstatus = (re.search(r"^status:\s*(\S+)", y, re.M) or [None, "?"])[1]
+        print(f"\n## {pdir.name}  [{pstatus}]  {goal}")
+        repos = re.findall(r"^\s*-\s*name:\s*(\S+)", y, re.M)
+        health = [f"{r}{'' if (hub / 'repos' / r).exists() else ' (BROKEN LINK)'}" for r in repos]
+        print(f"   repos: {', '.join(health) or 'none'}")
+        meetings = sorted((pdir / "meetings").glob("*.md"))
+        print(f"   last meeting: {meetings[-1].stem if meetings else 'none'}")
+        plans = sorted((pdir / "plans").glob("*/plan.md"))
+        if not plans:
+            print("   plans: none")
+        for pf in plans:
+            text = pf.read_text()
+            fm, _ = read_fm(text)
+            st = fm.get("status", "?")
+            print(f"   - {pf.parent.name:42} {st:17} updated {fm.get('updated', '?')}")
+            if NEXT_STEP.get(st):
+                print(f"       {NEXT_STEP[st]}")
+            for _, r in table_rows(text)[0]:
+                extra = f"  {r.get('branch', '')}" if r.get("branch") else ""
+                print(f"       {r.get('block', ''):6} {r.get('status', ''):14}{extra}")
+
+
+def default_branch(real: Path) -> str:
+    r = git(real, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().split("/", 1)[-1]
+    for b in ("main", "master"):
+        if git(real, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}", check=False).returncode == 0:
+            return b
+    return git(real, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+
+def wt_path(hub: Path, repo: str, branch: str) -> Path:
+    return hub / "worktrees" / repo / branch.replace("/", "__")
+
+
+def cmd_worktree(a):
+    hub = find_hub()
+    if a.action == "list":
+        root = str(hub / "worktrees")
+        for link in sorted((hub / "repos").iterdir()):
+            if link.is_symlink() and link.exists():
+                out = git(link, "worktree", "list", check=False).stdout.splitlines()
+                for line in out:
+                    if line.startswith(root):
+                        print(f"{link.name:24} {line}")
+        return
+    if not a.repo or not a.branch:
+        die("usage: rh worktree add|remove <repo> <branch> [--base BRANCH]")
+    real = repo_real(hub, a.repo)
+    wt = wt_path(hub, a.repo, a.branch)
+    if a.action == "add":
+        if wt.exists():
+            print(wt)
+            return
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        exists = git(real, "rev-parse", "--verify", "--quiet",
+                     f"refs/heads/{a.branch}", check=False).returncode == 0
+        if exists:
+            git(real, "worktree", "add", str(wt), a.branch)
+        else:
+            base = a.base or default_branch(real)
+            git(real, "worktree", "add", "-b", a.branch, str(wt), base)
+        print(wt)
+    elif a.action == "remove":
+        if not wt.exists():
+            die(f"no worktree at {wt}")
+        r = git(real, "worktree", "remove", str(wt), check=False)
+        if r.returncode != 0:
+            die(f"git refused to remove the worktree (uncommitted changes?):\n{r.stderr.strip()}")
+        print(f"Removed worktree {wt} (branch {a.branch} is kept)")
+
+
+def cmd_paths(a):
+    hub = find_hub(required=False)
+    print(f"kit:       {KIT_DIR}")
+    print(f"templates: {TEMPLATES}")
+    print(f"hub:       {hub or '(none)'}")
+    if hub:
+        print(f"compute:   {hub / 'compute.yaml'}")
+    print(f"config:    {CONFIG_FILE}")
+
+
+def cmd_doctor(a):
+    problems = 0
+
+    def report(ok, msg, level="FAIL"):
+        nonlocal problems
+        tag = "OK  " if ok else level
+        if not ok and level == "FAIL":
+            problems += 1
+        print(f"[{tag}] {msg}")
+
+    report(sys.version_info >= (3, 8), f"python {sys.version.split()[0]}")
+    hub = find_hub(required=False)
+    report(hub is not None, f"hub: {hub or 'not found (rh init-hub <path>)'}")
+    report(shutil.which("claude") is not None, "claude CLI on PATH")
+    report(shutil.which("tmux") is not None, "tmux available", "WARN")
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        report(var not in os.environ,
+               f"{var} not set (Remote Control needs a claude.ai login)", "WARN")
+    report(shutil.which("rh") is not None, "rh on PATH (~/.local/bin)", "WARN")
+    skills = list((Path.home() / ".claude" / "skills").glob("rh-*"))
+    report(len(skills) > 0, f"{len(skills)} rh-* skills installed in ~/.claude/skills")
+    name = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True).stdout.strip()
+    report(bool(name), "git user.name configured (needed for commits)")
+    if hub:
+        dirs = allowed_dirs(hub)
+        for link in sorted((hub / "repos").iterdir()):
+            if not link.is_symlink():
+                continue
+            if not link.exists():
+                report(False, f"repos/{link.name} is a broken link -> {os.readlink(link)}")
+            else:
+                report(str(link.resolve()) in dirs,
+                       f"repos/{link.name} allowed for Claude (additionalDirectories)")
+        comp = hub / "compute.yaml"
+        if comp.exists():
+            todos = comp.read_text().count("TODO")
+            report(todos == 0, f"compute.yaml: {todos} TODO value(s) left", "WARN")
+    print("\nAll good." if problems == 0 else f"\n{problems} problem(s) found.")
+
+
+# -------------------------------------------------------------------- main
+def main():
+    p = argparse.ArgumentParser(prog="rh", description="Research hub helper")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init-hub", help="create a hub from the template")
+    s.add_argument("path")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_init_hub)
+
+    s = sub.add_parser("link-repo", help="link an existing local repo into repos/ (no move)")
+    s.add_argument("path")
+    s.add_argument("--name")
+    s.add_argument("--project")
+    s.add_argument("--role")
+    s.set_defaults(fn=cmd_link_repo)
+
+    s = sub.add_parser("clone-repo", help="clone to a place you choose, then link it")
+    s.add_argument("url")
+    s.add_argument("dest", help="existing dir (clone goes inside) or the exact target path")
+    s.add_argument("--name")
+    s.add_argument("--project")
+    s.add_argument("--role")
+    s.set_defaults(fn=cmd_clone_repo)
+
+    s = sub.add_parser("unlink-repo", help="remove a link (never touches the code)")
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_unlink_repo)
+
+    s = sub.add_parser("repos", help="list linked repos and their health")
+    s.set_defaults(fn=cmd_repos)
+
+    s = sub.add_parser("attach", help="attach a linked repo to a project")
+    s.add_argument("project")
+    s.add_argument("repo")
+    s.add_argument("--role")
+    s.set_defaults(fn=cmd_attach)
+
+    s = sub.add_parser("new-project", help="create a project folder")
+    s.add_argument("name")
+    s.add_argument("--goal")
+    s.add_argument("--repos", nargs="*")
+    s.set_defaults(fn=cmd_new_project)
+
+    s = sub.add_parser("new-meeting", help="create a meeting notes file, print its path")
+    s.add_argument("project")
+    s.add_argument("--slug")
+    s.add_argument("--date")
+    s.set_defaults(fn=cmd_new_meeting)
+
+    s = sub.add_parser("new-plan", help="create a plan folder, print plan.md path")
+    s.add_argument("project")
+    s.add_argument("title")
+    s.add_argument("--slug")
+    s.set_defaults(fn=cmd_new_plan)
+
+    s = sub.add_parser("set-status", help="set a plan's status")
+    s.add_argument("plan", help="path, <project>/<plan-id>, or plan-id")
+    s.add_argument("status")
+    s.set_defaults(fn=cmd_set_status)
+
+    s = sub.add_parser("set-block", help="update a row of a plan's Block status table")
+    s.add_argument("plan")
+    s.add_argument("block")
+    s.add_argument("--status")
+    s.add_argument("--repos")
+    s.add_argument("--branch")
+    s.add_argument("--guide")
+    s.add_argument("--results")
+    s.add_argument("--notes")
+    s.set_defaults(fn=cmd_set_block)
+
+    s = sub.add_parser("status", help="overview of projects, plans and blocks")
+    s.add_argument("project", nargs="?")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("worktree", help="add/list/remove worktrees under hub/worktrees")
+    s.add_argument("action", choices=["add", "list", "remove"])
+    s.add_argument("repo", nargs="?")
+    s.add_argument("branch", nargs="?")
+    s.add_argument("--base")
+    s.set_defaults(fn=cmd_worktree)
+
+    s = sub.add_parser("paths", help="print kit / hub / template paths")
+    s.set_defaults(fn=cmd_paths)
+
+    s = sub.add_parser("doctor", help="check the installation")
+    s.set_defaults(fn=cmd_doctor)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

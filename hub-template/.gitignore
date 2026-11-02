@@ -1,0 +1,9 @@
+# Machine-specific: links to code bases and worktrees
+repos/
+worktrees/
+.claude/settings.local.json
+# Heavy or generated
+**/__pycache__/
+*.ckpt
+*.pt
+*.safetensors

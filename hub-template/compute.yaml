@@ -1,0 +1,42 @@
+# Settings for THIS machine, used to fill launch scripts and run guides.
+# No passwords, tokens or keys here — ever.
+# Replace every TODO. `rh doctor` counts the ones left.
+
+lab_server:
+  results_root: TODO            # where you copy results back, e.g. /data/me/results
+  smoke_test: cpu               # cpu | gpu — can quick tests use a GPU on this machine?
+  python_env: TODO              # how to activate the env for tests, e.g. "conda activate nlp"
+
+oar:
+  frontend: TODO                # host where you run oarsub ("local" if it's this machine)
+  code_root: TODO               # where the repos are, as seen from OAR nodes
+  results_root: TODO            # where OAR jobs write outputs
+  queue: default
+  resources: "/nodes=1/gpu=1"   # check your site's syntax (some use host=1/gpu=1)
+  gpu_property: ""              # e.g. "gpu_model='A100'" — empty for any GPU
+  walltime: "12:00:00"
+  env_setup: |
+    # TODO, e.g.:
+    # source ~/miniconda3/etc/profile.d/conda.sh
+    # conda activate nlp
+
+jeanzay:
+  login: TODO                   # your login (only shown in printed commands)
+  account: TODO                 # project id, e.g. abc  → abc@a100
+  default_gpu: a100             # v100 | a100 | h100
+  gpus: # verify qos names and cpus per GPU in the IDRIS documentation
+    v100: {account_suffix: v100, constraint: v100-32g, qos: TODO, cpus_per_gpu: 10}
+    a100: {account_suffix: a100, constraint: a100,     qos: TODO, cpus_per_gpu: 8}
+    h100: {account_suffix: h100, constraint: h100,     qos: TODO, cpus_per_gpu: 24}
+  walltime: "20:00:00"
+  code_root: TODO               # e.g. $WORK/code
+  results_root: TODO            # e.g. $WORK/results (or $SCRATCH/…)
+  modules: |
+    module purge
+    # TODO, e.g. module load pytorch-gpu/py3/<version>
+  env_setup: ""
+  offline_env: |
+    export HF_HUB_OFFLINE=1
+    export HF_DATASETS_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export WANDB_MODE=offline

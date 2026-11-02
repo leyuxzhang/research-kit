@@ -1,0 +1,7 @@
+# Project registry entry. Keep `repos:` as the LAST key: `rh` appends to it.
+name: {{name}}
+created: {{date}}
+goal: {{goal}}
+status: active            # active | paused | archived
+compute: [oar, jeanzay]   # where experiments of this project may run
+repos:
