@@ -65,7 +65,7 @@ TODO stays TODO in the generated scripts.
 If you already used this machine for your experiments, `rh suggest-compute`
 lists values found in your repos' launch scripts, shell history and Claude Code
 transcripts, with where each came from (it prints only the matched values, never
-the surrounding text). After step 3, ask Claude `/rh-setup-compute` to go
+the surrounding text). Once you have a research-hub session (step 5), type `/rh-setup-compute` there to go
 through them with you and fill the file; it writes only what you confirm.
 
 The file is git-ignored: it never goes into the hub's git or to GitHub.
@@ -95,30 +95,65 @@ close SSH; the server keeps running.
 ```
 `hub.sh` also restarts the server if it exits (e.g. after a network outage).
 
-## 5. Connect from anywhere
+## 5. Open a session on the server
 
-- **Claude Desktop:** Code tab → the session list shows sessions from
-  `research-hub@<server>` (computer icon, green dot when online). Start new
-  sessions there; each runs on the lab server.
-- **Browser:** claude.ai/code, same list.
-- **Phone:** Claude app → Code.
+In **Claude Desktop**: start a new **Code** session. In the environment picker
+(it offers "This computer", "Remote Control", and your servers), choose
+**research-hub** on your server (the name of the machine where you ran
+`hub.sh`, e.g. `decore2`). That session runs on the server, inside
+`~/research-hub`: it has the kit's skills, the hub's `CLAUDE.md`, your repos.
 
-Enable push notifications once, in any session on the server:
-`/config` → **Push when actions required** and **Push when Claude decides**.
+Don't pick "This computer": that runs on your desktop, where neither the kit
+nor your code is.
 
-## 6. First steps
+The same works from claude.ai/code in a browser and from the Claude phone app.
+Without the desktop app, SSH to the server and run
+`cd ~/research-hub && claude`: same thing, in the terminal.
 
-Start a new session **from Claude Desktop (Code tab), on `research-hub@<server>`**
-(or claude.ai/code, or the phone app). It runs on the lab server, in the hub,
-so it has the skills, `CLAUDE.md` and your repos. Don't use a local desktop
-session: the kit and your code aren't there. Already SSH'd in? Running
-`cd ~/research-hub && claude` on the server works too.
+Enable push notifications once, in such a session: type `/config` and turn on
+**Push when actions required** and **Push when Claude decides**.
 
-Then:
-- `/rh-import-project` for each existing project (links its code, maps it), or
-  `/rh-new-project`.
-- Paste meeting notes (or a photo) → `/rh-meeting` → `/rh-plan` → approve →
-  `/rh-design` → approve → "go" → `/rh-implement` runs while you're away.
+## 6. Where to type what
+
+| You type… | Where | Examples |
+|---|---|---|
+| Anything starting with `/rh-`, and plain requests | The chat box of the **research-hub session** from step 5 | `/rh-import-project`, "here are today's meeting notes" |
+| Shell commands: `rh …` (no slash), `git`, `bash install.sh`, `tmux` | A **terminal on the server** (SSH) | `rh doctor`, `rh update`, `rh suggest-compute` |
+
+You never need to type `rh …` commands in the chat: Claude runs them itself.
+You only use them in a terminal to install, check (`rh doctor`) or update.
+
+**The `/rh-…` commands take no options.** Type the command alone and Claude
+asks for what it needs. You can also skip the command and say it in plain
+words; Claude picks the matching skill from what you say:
+
+| Instead of… | You can say |
+|---|---|
+| `/rh-import-project` | "Import my project X. The code is in /home/me/code/x" |
+| `/rh-meeting` | "Notes from today's meeting with my supervisor: …" |
+| `/rh-status` | "Where are my projects at?" |
+
+If `/rh-…` commands don't show up when you type `/`, check that the session
+uses the research-hub environment (not "This computer"), then on the server
+run `rh doctor`: it must report the `rh-*` skills as installed in
+`~/.claude/skills`. Plain-words requests work either way once the skills are
+installed.
+
+## 7. First steps
+
+In the research-hub session:
+
+1. **Import each existing project.** Type `/rh-import-project` (or "import my
+   project X"). Claude asks for the project name, a one-line goal, and the path
+   of each code base **on the server**. It links the code where it is (never
+   moves or copies it), reads it, and writes a map of it. Check the summary it
+   gives and correct anything wrong.
+2. **Fill compute.yaml.** Type `/rh-setup-compute`. Claude shows values found
+   on the server and asks you to confirm each one.
+3. **Day to day:** paste meeting notes (or a photo) → `/rh-meeting` →
+   `/rh-plan` → you approve → `/rh-design` → you approve → say "go" →
+   `/rh-implement` runs while you're away. `/rh-status` shows where everything
+   is.
 
 ## Using it on another machine
 
@@ -168,7 +203,7 @@ file is still in the history.
 
 | Symptom | Fix |
 |---|---|
-| No session in the list | `tmux attach -t research-hub` on the server: is `hub.sh` running? Any error? |
+| No research-hub option in the environment picker | `tmux attach -t research-hub` on the server: is `hub.sh` running? Any error? |
 | "Remote Control is disabled by your organization's policy" | Team/Enterprise: ask an Owner to enable it |
 | "requires a claude.ai subscription" | `claude auth login` with the claude.ai account; unset API-key variables |
 | "Workspace not trusted" | Run `hub.sh` attached in tmux once and answer the prompt |
