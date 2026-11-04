@@ -44,9 +44,21 @@ Control server.
 | `/rh-brief` | Draft for the next supervisor meeting |
 | `/rh-setup-compute` | Fill `compute.yaml` from values found on the machine; you confirm each |
 | `/rh-update` | Update the kit and merge template changes into your hub |
+| `/rh-local` | Ask a read-only agent on your desktop about files there; only its answer comes back |
 
 You can also just talk normally ("here are today's notes", "resume project X");
 skills trigger from their descriptions.
+
+## Knowledge beyond the server
+- **Your desktop:** run `python bin\rh bridge` there (PowerShell) and Claude on the
+  server can ask a read-only local Claude about your notes, images and .csv files,
+  in the folders you choose. Only the answers reach the server; questions asked
+  while the desktop is off are queued and answered when it's back.
+- **Zotero:** search and full text of your papers through the Zotero Web API
+  (`rh zotero-enable`).
+- **Every source** is listed per project in `sources.md`.
+
+See docs/SETUP.md, steps 8-10 (also: how the hub stays light on a shared server).
 
 ## Guardrails
 - Code bases are **linked, never moved**; coding happens in git worktrees under

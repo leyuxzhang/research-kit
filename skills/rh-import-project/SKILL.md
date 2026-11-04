@@ -23,6 +23,9 @@ no commits, no checkout.
 Gather, cheapest first:
 - `git remote -v`, `git branch -a`, `git log --oneline -10`, current commit.
 - README, docs, `pyproject.toml` / `requirements*.txt` / `environment.yml`.
+- Material that isn't on this server (notes, slides, exported results on my
+  desktop): ask me, then **rh-local**; papers: the `zotero` tools. List them
+  in `projects/<p>/sources.md`.
 - A tree of the repo, skipping data, checkpoints, outputs, `.git`, caches.
 - Entry points: search for `if __name__ == "__main__"`, `argparse`, `hydra`,
   `click`, `typer`, `Trainer(`, and scripts in `scripts/`, `bin/`, `tools/`.

@@ -9,7 +9,8 @@ description: Draft a brief for my next supervisor meeting from everything that h
 The date of the latest file in `meetings/` is the cut-off (or a date I give).
 Read: plans updated since then (`updated:` front-matter, Changelog,
 Validation log), `impl/*.md` logs, `results/*/summary.md`, the Decisions log in
-`project.md`, and open questions in plans and meetings.
+`project.md`, open questions in plans and meetings, and desktop answers in
+`local/` since then. Papers to cite or compare with: the `zotero` tools.
 
 ## 2. Write `projects/<p>/reports/<date>-brief.md` (template `brief.md`)
 - **TL;DR:** 3 bullets max, the most important first.

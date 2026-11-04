@@ -10,6 +10,9 @@ description: Implement the approved design of a plan block by block — create g
   front-matter `status: approved`. Otherwise stop and say what's missing.
 - Which blocks: those with status `designed` (or the ones I name), in
   dependency order. Skip `implemented`, `dropped`, and `blocked` ones unless asked.
+- This server is shared: if another plan is already `implementing` (`rh status`),
+  ask before starting a second one (in unattended mode: don't start; record why
+  under "Decisions made without you" and stop).
 - `rh set-status <plan> implementing`.
 
 If I said "go", "run it", "I'm leaving", or similar: **unattended mode** (see

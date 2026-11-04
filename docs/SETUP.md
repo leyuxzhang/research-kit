@@ -155,6 +155,97 @@ In the research-hub session:
    `/rh-implement` runs while you're away. `/rh-status` shows where everything
    is.
 
+## 8. Let Claude read files on your desktop (optional)
+
+Claude runs on the server and can't see your desktop. With the **bridge**, it
+can ask a read-only Claude on your desktop to read and analyze files there
+(notes, images, .csv, documents), and gets back only that agent's answer. Your
+files never leave the desktop. The local agent can only read the folders you
+list; it can't write, run commands, or go on the web.
+
+You need, on the desktop: Python, and Claude Code (the VS Code extension is
+enough: the bridge finds its `claude.exe`). On the server: the kit up to date
+(`rh update`, server terminal).
+
+**Once, in PowerShell on your desktop:**
+```powershell
+git clone https://github.com/<you>/research-kit.git $HOME\tools\research-kit
+cd $HOME\tools\research-kit
+python bin\rh bridge --ssh lab --folder "C:\Users\<you>\Documents\Meetings" --folder "C:\Users\<you>\Documents\Results"
+```
+- `--ssh`: the name you type after `ssh` to reach the server (`lab` if you use
+  the `~/.ssh/config` from the top of this page).
+- `--folder`: each folder the local agent may read (repeat it). Saved: next
+  time you don't need to give them again. Giving `--folder` again replaces the list.
+
+It connects to the server: type your passwords as usual. When it prints
+**Bridge ready**, leave the window open (minimized is fine). Each question from
+the server appears there as one line.
+
+**Each day, in PowerShell on your desktop:**
+```powershell
+cd $HOME\tools\research-kit; python bin\rh bridge
+```
+Stop it with Ctrl+C or by closing the window. To update the desktop copy of
+the kit: `git pull` in that folder.
+
+**In the research-hub session:** just say what you need ("read my notes from
+the 28 October meeting on my desktop and ingest them"), or type `/rh-local`.
+- Answers are saved in the project under `local/`, and listed in `sources.md`.
+- If the bridge isn't running, the question is queued in the project's
+  `requests.md` and answered automatically the next time you start the bridge.
+  `/rh-status` shows what's waiting.
+
+## 9. Zotero (optional)
+
+Claude can search your Zotero library and read the full text of papers, from
+the server, through the Zotero Web API. This needs your library (and its files)
+synced to zotero.org, and a read-only API key that only you handle.
+
+1. **In a browser:** go to <https://www.zotero.org/settings/keys>. Note your
+   user ID shown there (`ZOTERO_LIBRARY_ID`). Create a new private key with
+   read access to your library and **no write access**.
+2. **Server terminal:** install `uv` (provides `uvx`, which runs the Zotero
+   server; no admin rights needed), unless `uvx --version` already works:
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+3. **Server terminal:** create your private env file and put the two values in it:
+   ```bash
+   mkdir -p ~/.config/research-kit
+   install -m 600 /dev/null ~/.config/research-kit/env   # readable by you only
+   nano ~/.config/research-kit/env
+   ```
+   ```
+   ZOTERO_API_KEY=<the key>
+   ZOTERO_LIBRARY_ID=<your user ID>
+   ```
+   Claude is not allowed to read this file. `hub.sh` loads it.
+4. **Server terminal:** `rh zotero-enable` (registers the Zotero tools in the hub), then restart the hub server:
+   ```bash
+   tmux kill-session -t research-hub
+   tmux new -d -s research-hub "bash -lc '$HOME/research-hub/hub.sh'"
+   ```
+5. **In a new research-hub session:** type `/mcp`; `zotero` should be listed as
+   connected. Then ask, e.g., "find my Zotero papers on subword tokenization".
+
+The Zotero tools can search, give an item's metadata, and its full text. They
+don't return your notes or annotations.
+
+## 10. Sharing the server with your lab
+
+Claude itself uses little: the model runs at Anthropic, and on the server
+Claude Code mostly waits. What uses the machine is what it runs (tests,
+analysis scripts, installs). `hub.sh` makes all of it polite:
+- low CPU and disk priority (`nice`, `ionice`): other people's work goes first;
+- math libraries limited to `lab_server.max_threads` threads (default 4);
+- with `lab_server.smoke_test: cpu`, GPUs are hidden from everything Claude runs.
+
+Change these in `compute.yaml`, then restart `hub.sh` (commands in step 9.4).
+Claude never launches training here, and runs one unattended `/rh-implement`
+at a time. `rh doctor` lists worktrees whose branch is already merged:
+remove them to free disk space.
+
 ## Using it on another machine
 
 Clone and install the kit, clone your hub repo, run `rh init-hub <hub path>`
@@ -213,3 +304,7 @@ file is still in the history.
 | `git pull` in the kit: "local changes … would be overwritten" (`bin/rh`, `install.sh`) | Only the `chmod +x` permissions differ: `git -c core.fileMode=false pull`, or just use `rh update` |
 | `rh update`: "has local changes" | You edited the kit itself: commit or stash in the kit dir, then rerun |
 | `<file>.kit-new` next to a hub file | Kit change that couldn't be merged automatically: `/rh-update` |
+| Bridge: "ssh ended before the bridge was registered" | Check that `ssh lab` works from PowerShell, and that the server's kit is up to date (`rh update`, then `rh doctor`, server terminal) |
+| Claude says your desktop is offline / request queued | Start the bridge on the desktop (step 8); queued requests are answered automatically |
+| Bridge: "Claude Code not found" | Install the Claude Code VS Code extension, or pass `--claude <path to claude.exe>` |
+| `zotero` missing or failed in `/mcp` | `uvx --version` and the two values in `~/.config/research-kit/env` (server terminal), then restart hub.sh (step 9.4) |

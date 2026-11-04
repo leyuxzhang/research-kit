@@ -13,13 +13,21 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import hmac
 import json
 import os
+import queue
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 KIT_DIR = Path(__file__).resolve().parent.parent
@@ -34,6 +42,11 @@ MARKER = ".research-hub"
 COMPUTE = "compute.yaml"
 # compute.yaml is private and machine-specific: it must never reach the hub's git.
 PRIVATE_IGNORES = ["compute.yaml", "compute.yaml.bak", "*.kit-new"]
+# Desktop bridge: on the server, where to reach the desktop (port + token, mode 600);
+# on the desktop, the local agent's empty working dir and the task log.
+BRIDGE_FILE = CONFIG_FILE.parent / "bridge.json"
+RK_HOME = Path.home() / ".research-kit"
+QUEUED_EXIT = 3
 
 PLAN_STATUSES = [
     "draft", "approved", "designed", "implementing", "implemented",
@@ -495,12 +508,13 @@ def cmd_new_project(a):
     pdir = hub / "projects" / name
     if pdir.exists():
         die(f"project {name} already exists")
-    for d in ("meetings", "plans", "guides", "results", "reports", "analysis", "codebase"):
+    for d in ("meetings", "plans", "guides", "results", "reports", "analysis", "codebase", "local"):
         (pdir / d).mkdir(parents=True)
     goal = a.goal or "TODO"
     (pdir / "project.yaml").write_text(
         render("project.yaml", name=name, date=today(), goal=json.dumps(goal)))
     (pdir / "project.md").write_text(render("project.md", title=a.name, goal=goal))
+    (pdir / "sources.md").write_text(render("sources.md", title=a.name))
     for repo in a.repos or []:
         attach(hub, name, repo)
     print(pdir)
@@ -588,6 +602,13 @@ def cmd_status(a):
         print(f"   repos: {', '.join(health) or 'none'}")
         meetings = sorted((pdir / "meetings").glob("*.md"))
         print(f"   last meeting: {meetings[-1].stem if meetings else 'none'}")
+        reqs = read_requests(pdir / "requests.md")
+        pending = [r["id"] for r in reqs if r["status"] == "pending"]
+        if pending:
+            print(f"   desktop requests waiting: {', '.join(pending)} (answered when `rh bridge` runs)")
+        answered = len(list((pdir / "local").glob("*.md")))
+        if answered:
+            print(f"   desktop answers: {answered} in local/")
         plans = sorted((pdir / "plans").glob("*/plan.md"))
         if not plans:
             print("   plans: none")
@@ -615,6 +636,25 @@ def default_branch(real: Path) -> str:
 
 def wt_path(hub: Path, repo: str, branch: str) -> Path:
     return hub / "worktrees" / repo / branch.replace("/", "__")
+
+
+def merged_worktrees(hub: Path, link: Path) -> list:
+    """Branches checked out under hub/worktrees that are already merged."""
+    root = str((hub / "worktrees").resolve())
+    branches = []
+    for block in git(link, "worktree", "list", "--porcelain", check=False).stdout.split("\n\n"):
+        f = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
+        if "branch" in f and str(Path(f.get("worktree", "")).resolve()).startswith(root):
+            branches.append(f["branch"].replace("refs/heads/", "", 1))
+    if not branches:
+        return []
+    base = default_branch(link)
+    done = git(link, "branch", "--merged", base, "--format=%(refname:short)", check=False).stdout.split()
+
+    def had_commits(b):  # a fresh branch is "merged" too; its reflog only has its creation
+        log = git(link, "reflog", "show", "--format=%H", f"refs/heads/{b}", check=False).stdout.split()
+        return len(log) != 1
+    return [b for b in branches if b in done and b != base and had_commits(b)]
 
 
 def cmd_worktree(a):
@@ -697,6 +737,11 @@ def cmd_doctor(a):
             else:
                 report(str(link.resolve()) in dirs,
                        f"repos/{link.name} allowed for Claude (additionalDirectories)")
+            merged = merged_worktrees(hub, link)
+            report(not merged, f"repos/{link.name}: no worktrees left on merged branches"
+                   + (f": {', '.join(merged)} (free disk: rh worktree remove {link.name} <branch>)"
+                      if merged else ""),
+                   "WARN")
         comp = hub / "compute.yaml"
         if comp.exists():
             todos = comp.read_text().count("TODO")
@@ -1033,6 +1078,454 @@ def cmd_suggest_compute(a):
             print(f"    {c['value']:<40} {src}{more}")
 
 
+# ----------------------------------------------------------- desktop bridge
+# The server agent asks a local agent on the desktop (`rh ask-local`) and gets
+# back only its answer. Desktop: `rh bridge` serves tasks on 127.0.0.1 and
+# opens `ssh -R` to the server. Each task runs a headless, read-only Claude
+# limited to the folders you allowed. Server: `rh bridge-register` (run by that
+# ssh session) records port + token; `rh ask-local` sends tasks, records the
+# answers in the project, and queues them while the desktop is offline.
+def find_claude(explicit=None):
+    """`claude` on PATH, else the newest one bundled with the VS Code extension."""
+    if explicit:
+        return explicit if Path(explicit).exists() else None
+    found = shutil.which("claude")
+    if found:
+        return found
+    cands = []
+    for ext in (".vscode", ".vscode-insiders"):
+        for d in (Path.home() / ext / "extensions").glob("anthropic.claude-code-*"):
+            m = re.search(r"claude-code-(\d+(?:\.\d+)*)", d.name)
+            ver = tuple(int(x) for x in m.group(1).split(".")) if m else ()
+            for name in ("claude.exe", "claude"):
+                b = d / "resources" / "native-binary" / name
+                if b.exists():
+                    cands.append((ver, str(b)))
+    return max(cands)[1] if cands else None
+
+
+def run_local_agent(claude: str, task: str, folders: list, timeout: int) -> dict:
+    """One headless, read-only Claude run. The task goes on stdin (the
+    variadic --tools/--add-dir options would swallow a positional prompt)."""
+    ws = RK_HOME / "local-workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    ws = ws.resolve()  # Claude refuses Windows short (8.3) paths like YUXUAN~1
+    cmd = [claude, "-p", "--output-format", "json",
+           "--tools", "Read,Grep,Glob", "--setting-sources", "", "--strict-mcp-config",
+           "--no-session-persistence",
+           "--append-system-prompt-file", str(TEMPLATES / "local-agent.md")]
+    for f in folders:
+        cmd += ["--add-dir", f]
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, input=task, cwd=ws, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "answer": f"local agent timed out after {timeout} s",
+                "seconds": round(time.time() - t0)}
+    try:
+        out = json.loads(r.stdout)
+        ok = not out.get("is_error") and r.returncode == 0
+        answer = out.get("result") or ""
+    except json.JSONDecodeError:
+        ok, answer = False, (r.stderr or r.stdout).strip()[-2000:]
+    return {"status": "done" if ok else "error", "answer": answer,
+            "seconds": round(time.time() - t0)}
+
+
+class Bridge:
+    """Tasks run one at a time, to bound the desktop's load and usage."""
+
+    def __init__(self, claude, folders, timeout):
+        self.claude, self.folders, self.timeout = claude, folders, timeout
+        self.token = None
+        self.tasks = collections.OrderedDict()
+        self.todo = queue.Queue()
+        self.lock = threading.Lock()
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    def submit(self, task: str, project: str) -> str:
+        tid = secrets.token_hex(6)
+        with self.lock:
+            self.tasks[tid] = {"status": "queued", "task": task, "project": project}
+            while len(self.tasks) > 200:
+                self.tasks.popitem(last=False)
+        self.todo.put(tid)
+        return tid
+
+    def worker(self):
+        while True:
+            tid = self.todo.get()
+            with self.lock:
+                t = self.tasks.get(tid)
+                if not t:
+                    continue
+                t["status"] = "running"
+            stamp = dt.datetime.now().strftime("%H:%M:%S")
+            first = t["task"].strip().splitlines()[0][:70] if t["task"].strip() else ""
+            print(f"[{stamp}] {t['project'] or '-'}: {first}", flush=True)
+            res = run_local_agent(self.claude, t["task"], self.folders, self.timeout)
+            with self.lock:
+                t.update(res)
+            print(f"           {res['status']} in {res['seconds']} s", flush=True)
+            log = RK_HOME / "bridge-log" / f"{today()}.jsonl"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"time": dt.datetime.now().isoformat(timespec="seconds"),
+                                     "project": t["project"], "task": t["task"],
+                                     "status": res["status"], "seconds": res["seconds"],
+                                     "answer_chars": len(res["answer"])}) + "\n")
+
+
+def bridge_handler(bridge: Bridge):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def authorized(self):
+            got = self.headers.get("Authorization", "")
+            ok = bridge.token is not None and hmac.compare_digest(got, f"Bearer {bridge.token}")
+            if not ok:
+                self.reply(401, {"error": "unauthorized"})
+            return ok
+
+        def do_GET(self):
+            if not self.authorized():
+                return
+            if self.path == "/health":
+                return self.reply(200, {"ok": True})
+            m = re.fullmatch(r"/tasks/([0-9a-f]+)", self.path)
+            with bridge.lock:
+                t = bridge.tasks.get(m.group(1)) if m else None
+                t = dict(t) if t else None
+            if not t:
+                return self.reply(404, {"error": "no such task"})
+            self.reply(200, {k: t.get(k) for k in ("status", "answer", "seconds")})
+
+        def do_POST(self):
+            if not self.authorized():
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            if self.path != "/tasks" or not 0 < n <= 100_000:
+                return self.reply(400, {"error": "POST /tasks with a JSON body"})
+            try:
+                body = json.loads(self.rfile.read(n))
+                task = str(body["task"]).strip()
+            except (ValueError, KeyError, TypeError):
+                return self.reply(400, {"error": "body must be {\"task\": ..., \"project\": ...}"})
+            if not task:
+                return self.reply(400, {"error": "empty task"})
+            self.reply(202, {"id": bridge.submit(task, str(body.get("project") or ""))})
+
+    return Handler
+
+
+def write_bridge_file(port: int, token: str, origin: str) -> None:
+    BRIDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        BRIDGE_FILE.write_text(json.dumps({"port": port, "token": token, "from": origin,
+                                           "since": dt.datetime.now().isoformat(timespec="seconds")}))
+    finally:
+        os.umask(old)
+    try:
+        os.chmod(BRIDGE_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def cmd_bridge(a):
+    cfg = load_config()
+    b = cfg.setdefault("bridge", {})
+    if a.ssh:
+        b["ssh"] = a.ssh
+    if a.folder:
+        b["folders"] = [str(Path(f).expanduser().resolve()) for f in a.folder]
+    if a.claude:
+        b["claude"] = a.claude
+    save_config(cfg)
+    folders = b.get("folders") or []
+    if not folders:
+        die("no folder allowed yet: rh bridge --folder <path> [--folder <path> ...]")
+    missing = [f for f in folders if not Path(f).is_dir()]
+    if missing:
+        die(f"allowed folder(s) not found: {', '.join(missing)}")
+    claude = find_claude(b.get("claude"))
+    if not claude:
+        die("Claude Code not found: no `claude` on PATH and no VS Code extension binary. "
+            "Pass --claude <path to claude.exe>.")
+    if not a.no_ssh and not b.get("ssh"):
+        die("which server? rh bridge --ssh <host as in your ssh config, e.g. lab>")
+
+    bridge = Bridge(claude, folders, a.timeout)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bridge_handler(bridge))
+    lport = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Local agent: {claude}")
+    print("Allowed folders (read-only):\n" + "\n".join(f"  {f}" for f in folders))
+
+    if a.no_ssh:  # testing, or the hub runs on this same machine
+        bridge.token = secrets.token_urlsafe(32)
+        write_bridge_file(lport, bridge.token, "local")
+        print(f"\nBridge ready on 127.0.0.1:{lport} (no ssh). Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            BRIDGE_FILE.unlink(missing_ok=True)
+            print("\nBridge stopped.")
+        return
+
+    host = b["ssh"]
+    for attempt in range(1, 4):
+        rport = 20000 + secrets.randbelow(40000)
+        remote = ("bash -lc 'exec \"$(command -v rh || echo $HOME/.local/bin/rh)\" "
+                  f"bridge-register --port {rport} --hold'")
+        print(f"\nConnecting to {host} (type your passwords as usual)...", flush=True)
+        proc = subprocess.Popen(
+            ["ssh", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=60",
+             "-R", f"{rport}:127.0.0.1:{lport}", host, remote],
+            stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        for line in proc.stdout:
+            if line.startswith("RH-BRIDGE-TOKEN "):
+                bridge.token = line.split(None, 1)[1].strip()
+                break
+        if bridge.token:
+            break
+        proc.wait()
+        print(f"ssh ended before the bridge was registered (attempt {attempt}/3; "
+              "a taken port is retried with another).", flush=True)
+    else:
+        die("could not open the bridge. Check that `ssh <host>` works and that `rh` is "
+            "installed on the server (rh doctor there).")
+    print(f"\nBridge ready: {host} can now ask this desktop. Leave this window open; "
+          "Ctrl+C to stop.\n", flush=True)
+    try:
+        for _ in proc.stdout:
+            pass
+        proc.wait()
+        print("\nConnection to the server closed. Bridge stopped; run `rh bridge` again to reconnect.")
+    except KeyboardInterrupt:
+        proc.terminate()
+        print("\nBridge stopped.")
+
+
+def cmd_bridge_register(a):
+    """Server side, run by the desktop's ssh session."""
+    token = secrets.token_urlsafe(32)
+    write_bridge_file(a.port, token, os.environ.get("SSH_CLIENT", "ssh").split()[0])
+    print(f"RH-BRIDGE-TOKEN {token}", flush=True)
+    if not a.hold:
+        return
+    # Answer what was asked while the desktop was off.
+    subprocess.Popen([sys.executable, str(KIT_DIR / "bin" / "rh"), "ask-local", "--drain"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        sys.stdin.read()  # returns when the desktop's ssh closes
+    finally:
+        try:
+            if json.loads(BRIDGE_FILE.read_text()).get("token") == token:
+                BRIDGE_FILE.unlink()
+        except (OSError, ValueError):
+            pass
+
+
+class BridgeDown(Exception):
+    pass
+
+
+def bridge_call(method: str, path: str, body=None, timeout=15):
+    try:
+        conf = json.loads(BRIDGE_FILE.read_text())
+    except (OSError, ValueError):
+        raise BridgeDown("no bridge registered")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{conf['port']}{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {conf['token']}", "Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never via http_proxy
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise BridgeDown("bridge rejected the token (stale registration)")
+        raise BridgeDown(f"bridge answered HTTP {e.code}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise BridgeDown(str(getattr(e, "reason", e)))
+
+
+def ask_desktop(task: str, project: str, wait: int):
+    """Returns (task id, result dict or None if still running). Raises BridgeDown."""
+    tid = bridge_call("POST", "/tasks", {"task": task, "project": project})["id"]
+    return tid, poll_desktop(tid, wait)
+
+
+def poll_desktop(tid: str, wait: int):
+    end = time.time() + wait
+    while True:
+        res = bridge_call("GET", f"/tasks/{tid}")
+        if res["status"] in ("done", "error"):
+            return res
+        if time.time() >= end:
+            return None
+        time.sleep(3)
+
+
+def record_local(pdir: Path, task: str, res: dict, asked: str) -> Path:
+    first = task.strip().splitlines()[0]
+    slug = slugify(" ".join(first.split()[:6]))[:50]
+    out = pdir / "local" / f"{today()}-{slug}.md"
+    n = 2
+    while out.exists():
+        out = out.with_name(f"{today()}-{slug}-{n}.md")
+        n += 1
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        f"---\nsource: desktop\nasked: {asked}\n"
+        f"answered: {dt.datetime.now().isoformat(timespec='seconds')}\n"
+        f"seconds: {res.get('seconds')}\n---\n# {first[:100]}\n\n"
+        f"## Task\n{task.strip()}\n\n## Answer\n{(res.get('answer') or '').strip()}\n",
+        encoding="utf-8")
+    return out
+
+
+REQ_RE = re.compile(r"^## (R\d+) · (\S+ \S+) · (.*)$", re.M)
+
+
+def read_requests(f: Path) -> list:
+    text = f.read_text(encoding="utf-8") if f.exists() else ""
+    ms = list(REQ_RE.finditer(text))
+    return [{"id": m.group(1), "asked": m.group(2), "status": m.group(3).strip(),
+             "task": text[m.end():ms[i + 1].start() if i + 1 < len(ms) else len(text)].strip()}
+            for i, m in enumerate(ms)]
+
+
+def queue_request(pdir: Path, task: str) -> str:
+    f = pdir / "requests.md"
+    reqs = read_requests(f)
+    rid = f"R{len(reqs) + 1:03d}"
+    if not f.exists():
+        f.write_text("# Requests to the desktop\n\nAsked while the desktop was offline; "
+                     "answered automatically when `rh bridge` reconnects.\n", encoding="utf-8")
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n## {rid} · {now} · pending\n{task.strip()}\n")
+    return rid
+
+
+def set_request_status(pdir: Path, rid: str, status: str) -> None:
+    f = pdir / "requests.md"
+    text = f.read_text(encoding="utf-8")
+    text = re.sub(rf"^(## {rid} · \S+ \S+ · ).*$", lambda m: m.group(1) + status, text,
+                  count=1, flags=re.M)
+    f.write_text(text, encoding="utf-8")
+
+
+def cmd_ask_local(a):
+    hub = find_hub()
+    if a.drain:
+        drain_requests(hub)
+        return
+    if not a.project:
+        die("--project is required (answers are recorded in the project)")
+    pdir = project_dir(hub, a.project)
+    asked = dt.datetime.now().isoformat(timespec="seconds")
+    try:
+        if a.result:
+            tid, res = a.result, poll_desktop(a.result, a.wait)
+            task = a.task or f"(task {a.result})"
+        else:
+            if not a.task:
+                die("give the task: rh ask-local --project P \"<what to read or analyze>\"")
+            task = a.task
+            tid, res = ask_desktop(task, pdir.name, a.wait)
+    except BridgeDown as e:
+        if a.result:
+            die(f"desktop unreachable ({e}); the answer to {a.result} is lost if the bridge restarted")
+        rid = queue_request(pdir, a.task)
+        print(f"queued as {rid} in {pdir.name}/requests.md: the desktop is offline ({e}).\n"
+              "It will be answered automatically when the user starts `rh bridge` on the desktop.")
+        sys.exit(QUEUED_EXIT)
+    if res is None:
+        print(f"still running on the desktop. Fetch it later with:\n"
+              f"  rh ask-local --project {pdir.name} --result {tid} \"<same task>\"")
+        sys.exit(QUEUED_EXIT)
+    if res["status"] != "done":
+        die(f"the desktop agent failed: {res.get('answer')}")
+    out = record_local(pdir, task, res, asked)
+    print(res["answer"].strip())
+    print(f"\n(recorded in {out.relative_to(hub).as_posix()})")
+
+
+def drain_requests(hub: Path) -> None:
+    for _ in range(10):  # the desktop learns its token a moment after registering
+        try:
+            bridge_call("GET", "/health")
+            break
+        except BridgeDown:
+            time.sleep(3)
+    else:
+        die("desktop bridge unreachable; pending requests stay queued")
+    for f in sorted((hub / "projects").glob("*/requests.md")):
+        pdir = f.parent
+        for r in read_requests(f):
+            if r["status"] != "pending":
+                continue
+            try:
+                _, res = ask_desktop(r["task"], pdir.name, 1800)
+            except BridgeDown as e:
+                die(f"bridge lost while draining ({e}); the rest stays queued")
+            if res and res["status"] == "done":
+                out = record_local(pdir, r["task"], res, r["asked"])
+                set_request_status(pdir, r["id"], f"answered → {out.relative_to(pdir).as_posix()}")
+                print(f"{pdir.name} {r['id']}: answered")
+            else:
+                print(f"{pdir.name} {r['id']}: {'failed' if res else 'timed out'}; left pending")
+
+
+ZOTERO_MCP = {"command": "uvx", "args": ["zotero-mcp"],
+              "env": {"ZOTERO_LOCAL": "false", "ZOTERO_API_KEY": "${ZOTERO_API_KEY}",
+                      "ZOTERO_LIBRARY_ID": "${ZOTERO_LIBRARY_ID}",
+                      "ZOTERO_LIBRARY_TYPE": "${ZOTERO_LIBRARY_TYPE:-user}"}}
+
+
+def cmd_zotero_enable(a):
+    """Registers the Zotero MCP server (Web API) in the hub. The key itself stays in
+    ~/.config/research-kit/env, which hub.sh sources and Claude can't read."""
+    hub = find_hub()
+    envf = CONFIG_FILE.parent / "env"
+    env_text = envf.read_text() if envf.exists() else ""
+    missing = [v for v in ("ZOTERO_API_KEY", "ZOTERO_LIBRARY_ID")
+               if not re.search(rf"^\s*(export\s+)?{v}=\S", env_text, re.M)]
+    mcp = hub / ".mcp.json"
+    data = json.loads(mcp.read_text()) if mcp.exists() else {}
+    data.setdefault("mcpServers", {})["zotero"] = ZOTERO_MCP
+    mcp.write_text(json.dumps(data, indent=2) + "\n")
+    f = settings_local(hub)
+    s = json.loads(f.read_text()) if f.exists() else {}
+    enabled = s.setdefault("enabledMcpjsonServers", [])
+    if "zotero" not in enabled:
+        enabled.append("zotero")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(s, indent=2) + "\n")
+    print(f"Zotero MCP server registered in {mcp} (Web API mode).")
+    if missing:
+        print(f"Still to do: add {', '.join(missing)} to {envf} (see docs/SETUP.md, Zotero).")
+    if not shutil.which("uvx"):
+        print("Still to do: install uv (provides `uvx`), see docs/SETUP.md, Zotero.")
+    print("Then restart hub.sh so new sessions get the key.")
+
+
 # -------------------------------------------------------------------- main
 def main():
     p = argparse.ArgumentParser(prog="rh", description="Research hub helper")
@@ -1126,6 +1619,30 @@ def main():
     s.add_argument("--no-pull", action="store_true", help="skip `git pull` (kit already updated)")
     s.add_argument("--dry-run", action="store_true", help="show what would change; no pull, no writes")
     s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("bridge", help="(desktop) let the server's agent ask a read-only local agent")
+    s.add_argument("--ssh", help="server host as in your ssh config (saved)")
+    s.add_argument("--folder", action="append", help="folder the local agent may read (repeatable; saved)")
+    s.add_argument("--claude", help="path to claude / claude.exe (default: PATH, then VS Code extension)")
+    s.add_argument("--timeout", type=int, default=900, help="seconds per task (default 900)")
+    s.add_argument("--no-ssh", action="store_true", help="register on this machine (testing)")
+    s.set_defaults(fn=cmd_bridge)
+
+    s = sub.add_parser("bridge-register", help="(server, run by the bridge's ssh) record port and token")
+    s.add_argument("--port", type=int, required=True)
+    s.add_argument("--hold", action="store_true", help="stay until ssh closes, then unregister")
+    s.set_defaults(fn=cmd_bridge_register)
+
+    s = sub.add_parser("ask-local", help="ask the desktop's local agent; prints only its answer")
+    s.add_argument("task", nargs="?")
+    s.add_argument("--project")
+    s.add_argument("--wait", type=int, default=540, help="seconds to wait (default 540)")
+    s.add_argument("--result", metavar="ID", help="fetch a task that was still running")
+    s.add_argument("--drain", action="store_true", help="send queued requests (run on connect)")
+    s.set_defaults(fn=cmd_ask_local)
+
+    s = sub.add_parser("zotero-enable", help="register the Zotero MCP server (Web API) in the hub")
+    s.set_defaults(fn=cmd_zotero_enable)
 
     s = sub.add_parser("suggest-compute",
                        help="suggest compute.yaml values found in repo scripts, histories, transcripts")
