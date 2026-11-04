@@ -49,7 +49,8 @@
       "Bash(cp:*)",
       "Bash(chmod +x:*)",
       "Bash(nvidia-smi:*)",
-      "Bash(oarstat:*)"
+      "Bash(oarstat:*)",
+      "mcp__zotero"
     ],
     "deny": [
       "Bash(sbatch:*)",
@@ -67,7 +68,10 @@
       "Bash(git push origin master:*)",
       "Bash(git reset --hard:*)",
       "Bash(git clean:*)",
-      "Read(~/.ssh/**)"
+      "Read(~/.ssh/**)",
+      "Read(~/.config/research-kit/**)",
+      "Bash(cat ~/.config/research-kit/:*)",
+      "Bash(source ~/.config/research-kit/:*)"
     ]
   }
 }

@@ -18,7 +18,9 @@ project list from `rh status`). An idea that fits no project → offer
 
 ## 3. Raw notes: verbatim
 Copy exactly what I wrote, in my language. For a photo, transcribe it and mark
-unreadable words `[?]`. For an attached file, quote its text. Never clean up,
+unreadable words `[?]`. For an attached file, quote its text. Notes that are on
+my desktop (I mention a file or folder there): get them with **rh-local**
+(ask for the verbatim text of the notes). Never clean up,
 reorder, or translate the raw section: it is the source of truth.
 
 ## 4. Structure (in English unless the project says otherwise)

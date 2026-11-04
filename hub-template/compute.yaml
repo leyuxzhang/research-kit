@@ -26,7 +26,14 @@ lab_server:
   results_root: TODO
 
   # cpu | gpu — whether quick smoke tests may use a GPU on this machine.
+  # With cpu, hub.sh hides the GPUs from everything Claude runs
+  # (CUDA_VISIBLE_DEVICES=""), so a test can't take one by accident.
   smoke_test: cpu
+
+  # integer — max threads for math libraries (OpenMP, MKL, OpenBLAS) in
+  # anything Claude runs here, so tests don't grab every core of a shared
+  # machine. Read by hub.sh at start: restart it after a change.
+  max_threads: 4
 
   # command — activates the Python env used for tests on this machine.
   #   e.g. conda activate nlp     or   source ~/venvs/nlp/bin/activate
