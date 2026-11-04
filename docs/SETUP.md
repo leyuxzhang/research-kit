@@ -108,7 +108,13 @@ Enable push notifications once, in any session on the server:
 
 ## 6. First steps
 
-In a new session:
+Start a new session **from Claude Desktop (Code tab), on `research-hub@<server>`**
+(or claude.ai/code, or the phone app). It runs on the lab server, in the hub,
+so it has the skills, `CLAUDE.md` and your repos. Don't use a local desktop
+session: the kit and your code aren't there. Already SSH'd in? Running
+`cd ~/research-hub && claude` on the server works too.
+
+Then:
 - `/rh-import-project` for each existing project (links its code, maps it), or
   `/rh-new-project`.
 - Paste meeting notes (or a photo) → `/rh-meeting` → `/rh-plan` → approve →
