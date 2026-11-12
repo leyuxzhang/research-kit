@@ -177,6 +177,9 @@ python bin\rh bridge --ssh lab --folder "C:\Users\<you>\Documents\Meetings" --fo
   the `~/.ssh/config` from the top of this page).
 - `--folder`: each folder the local agent may read (repeat it). Saved: next
   time you don't need to give them again. Giving `--folder` again replaces the list.
+  Your whole home folder or a whole drive is refused. Even inside these folders,
+  the agent can never read secrets (`.ssh`, `.env`, key files, `.claude`,
+  `AppData`…) and skips bulky folders (`.git`, `.venv`, `node_modules`, caches).
 
 It connects to the server: type your passwords as usual. When it prints
 **Bridge ready**, leave the window open (minimized is fine). Each question from
@@ -195,6 +198,27 @@ the 28 October meeting on my desktop and ingest them"), or type `/rh-local`.
 - If the bridge isn't running, the question is queued in the project's
   `requests.md` and answered automatically the next time you start the bridge.
   `/rh-status` shows what's waiting.
+
+### Notion, through the bridge
+
+The server can't reach Notion, but your desktop can, through the Notion
+connector of your claude.ai account. The bridge can run Notion tasks too:
+- **Reading** (pages, meeting notes, databases, comments): always available.
+- **Writing** (new pages, page updates, comments): only under one home page you
+  choose, and only after you click **Yes** in a dialog that pops up on your
+  desktop showing exactly what will be written. If you're away, the request
+  waits for you.
+- **Never possible:** deleting, moving or restoring pages, changing databases,
+  calendar, Notion agents.
+
+**Once, in PowerShell on your desktop**, set the home page (the link from
+Notion's "Copy link" on that page; saved like the folders):
+```powershell
+cd $HOME\tools\research-kit; python bin\rh bridge --notion-parent "<link of the Notion page>"
+```
+In the research-hub session, just ask: "what did we decide in my last meeting
+notes in Notion?", or say yes when `/rh-daily` or `/rh-brief` offers to
+publish. Daily reports go under a "Rapports quotidiens" subpage of the home page.
 
 ## 9. Zotero (optional)
 

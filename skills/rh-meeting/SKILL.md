@@ -20,7 +20,9 @@ project list from `rh status`). An idea that fits no project → offer
 Copy exactly what I wrote, in my language. For a photo, transcribe it and mark
 unreadable words `[?]`. For an attached file, quote its text. Notes that are on
 my desktop (I mention a file or folder there): get them with **rh-local**
-(ask for the verbatim text of the notes). Never clean up,
+(ask for the verbatim text of the notes). Notes in Notion (a page link, or
+"my notes in Notion"): **rh-local** with `--notion read`, asking for the
+verbatim text and the page link; keep the link in the meeting file. Never clean up,
 reorder, or translate the raw section: it is the source of truth.
 
 ## 4. Structure (in English unless the project says otherwise)

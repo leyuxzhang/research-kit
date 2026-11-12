@@ -1104,18 +1104,87 @@ def find_claude(explicit=None):
     return max(cands)[1] if cands else None
 
 
-def run_local_agent(claude: str, task: str, folders: list, timeout: int) -> dict:
-    """One headless, read-only Claude run. The task goes on stdin (the
-    variadic --tools/--add-dir options would swallow a positional prompt)."""
+# Never readable by the local agent, even inside an allowed folder: secrets, and
+# bulky folders that only slow searches down. Rules must be absolute (`//**/`):
+# relative ones are matched against the agent's empty working dir.
+BLOCKED_READS = [
+    ".ssh/**", ".gnupg/**", ".aws/**", ".azure/**", ".kube/**", ".claude/**", "AppData/**",
+    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*",
+    ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+    ".git/**", "node_modules/**", ".venv/**", "venv/**", "__pycache__/**", ".mypy_cache/**",
+    ".pytest_cache/**", ".tox/**", "*.ckpt", "*.pt", "*.safetensors",
+]
+# Notion tasks go through the user's claude.ai connector. In dontAsk mode every
+# tool not listed here is refused; the deny list also removes tools that a
+# read-only check would otherwise let through (shells) and anything destructive.
+NOTION = "mcp__claude_ai_Notion__notion-"
+NOTION_READ = ["search", "fetch", "query-meeting-notes", "query-data-sources",
+               "query-multiple-data-sources", "get-comments", "list-recent-pages",
+               "list-page-backlinks", "get-self"]
+NOTION_WRITE = NOTION_READ + ["create-pages", "update-page", "create-comment"]
+NOTION_DENY = ["PowerShell", "Bash", "Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit",
+               "WebFetch", "WebSearch", "Agent", "Task", "Workflow", "SendMessage", "Skill",
+               "Artifact", "ArtifactData", "ArtifactComments", "CronCreate", "CronDelete",
+               "RemoteTrigger", "PushNotification", "EnterWorktree", "ExitWorktree",
+               "ScheduleWakeup"] + [NOTION + t for t in (
+                   "delete-pages", "delete-databases", "move-pages", "restore-pages",
+                   "restore-version", "duplicate-page", "spawn-session", "stop-session",
+                   "send-message-to-session", "upload-skill", "convert-page-to-skill",
+                   "update-skill-settings", "calendar-create-events", "calendar-update-events",
+                   "calendar-cancel-events", "get-users", "create-database",
+                   "update-data-source")]
+KINDS = ("files", "notion-read", "notion-write")
+
+
+def agent_command(claude: str, kind: str, folders: list, notion_parent: str) -> list:
+    base = [claude, "-p", "--output-format", "json", "--setting-sources", "",
+            "--no-session-persistence"]
+    if kind == "files":
+        rules = {"permissions": {"deny": [f"Read(//**/{p})" for p in BLOCKED_READS]}}
+        cmd = base + ["--tools", "Read,Grep,Glob", "--strict-mcp-config",
+                      "--settings", json.dumps(rules),
+                      "--append-system-prompt-file", str(TEMPLATES / "local-agent.md")]
+        for f in folders:
+            cmd += ["--add-dir", f]
+        return cmd
+    tools = NOTION_WRITE if kind == "notion-write" else NOTION_READ
+    prompt = render("local-agent-notion.md", parent=notion_parent or "(none configured)",
+                    mode="read and write" if kind == "notion-write" else "read only")
+    return base + ["--permission-mode", "dontAsk",
+                   "--allowedTools", ",".join(["ToolSearch"] + [NOTION + t for t in tools]),
+                   "--disallowedTools", ",".join(NOTION_DENY),
+                   "--append-system-prompt", prompt]
+
+
+def confirm_write(task: str) -> bool:
+    """Ask the user on the desktop before anything is written to Notion."""
+    print("\n--- The server asks to WRITE to Notion ---\n" + task.strip() + "\n---", flush=True)
+    test = os.environ.get("RH_TEST_CONFIRM")  # automated tests only
+    if test in ("yes", "no"):
+        return test == "yes"
+    if sys.platform != "win32":
+        print("Refused: write confirmation needs the Windows dialog.", flush=True)
+        return False
+    import ctypes
+    text = task.strip()
+    if len(text) > 1500:
+        text = text[:1500] + "\n[...] (full text in the bridge window)"
+    MB_YESNO, MB_ICONQUESTION, MB_TOPMOST, MB_SETFOREGROUND, IDYES = 0x4, 0x20, 0x40000, 0x10000, 6
+    answer = ctypes.windll.user32.MessageBoxW(
+        None, "The research hub asks to write to Notion:\n\n" + text + "\n\nAllow?",
+        "research-kit bridge: write to Notion?",
+        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND)
+    return answer == IDYES
+
+
+def run_local_agent(claude: str, task: str, folders: list, timeout: int,
+                    kind: str = "files", notion_parent: str = "") -> dict:
+    """One headless Claude run: read-only on the allowed folders, or Notion-only.
+    The task goes on stdin (variadic options would swallow a positional prompt)."""
     ws = RK_HOME / "local-workspace"
     ws.mkdir(parents=True, exist_ok=True)
     ws = ws.resolve()  # Claude refuses Windows short (8.3) paths like YUXUAN~1
-    cmd = [claude, "-p", "--output-format", "json",
-           "--tools", "Read,Grep,Glob", "--setting-sources", "", "--strict-mcp-config",
-           "--no-session-persistence",
-           "--append-system-prompt-file", str(TEMPLATES / "local-agent.md")]
-    for f in folders:
-        cmd += ["--add-dir", f]
+    cmd = agent_command(claude, kind, folders, notion_parent)
     t0 = time.time()
     try:
         r = subprocess.run(cmd, input=task, cwd=ws, capture_output=True, text=True,
@@ -1136,18 +1205,19 @@ def run_local_agent(claude: str, task: str, folders: list, timeout: int) -> dict
 class Bridge:
     """Tasks run one at a time, to bound the desktop's load and usage."""
 
-    def __init__(self, claude, folders, timeout):
+    def __init__(self, claude, folders, timeout, notion_parent=""):
         self.claude, self.folders, self.timeout = claude, folders, timeout
+        self.notion_parent = notion_parent
         self.token = None
         self.tasks = collections.OrderedDict()
         self.todo = queue.Queue()
         self.lock = threading.Lock()
         threading.Thread(target=self.worker, daemon=True).start()
 
-    def submit(self, task: str, project: str) -> str:
+    def submit(self, task: str, project: str, kind: str = "files") -> str:
         tid = secrets.token_hex(6)
         with self.lock:
-            self.tasks[tid] = {"status": "queued", "task": task, "project": project}
+            self.tasks[tid] = {"status": "queued", "task": task, "project": project, "kind": kind}
             while len(self.tasks) > 200:
                 self.tasks.popitem(last=False)
         self.todo.put(tid)
@@ -1163,8 +1233,17 @@ class Bridge:
                 t["status"] = "running"
             stamp = dt.datetime.now().strftime("%H:%M:%S")
             first = t["task"].strip().splitlines()[0][:70] if t["task"].strip() else ""
-            print(f"[{stamp}] {t['project'] or '-'}: {first}", flush=True)
-            res = run_local_agent(self.claude, t["task"], self.folders, self.timeout)
+            tag = "" if t["kind"] == "files" else f"[{t['kind']}] "
+            print(f"[{stamp}] {t['project'] or '-'}: {tag}{first}", flush=True)
+            if t["kind"] == "notion-write" and not self.notion_parent:
+                res = {"status": "error", "seconds": 0,
+                       "answer": "no Notion home page set on the desktop: rh bridge --notion-parent <link>"}
+            elif t["kind"] == "notion-write" and not confirm_write(t["task"]):
+                res = {"status": "error", "seconds": 0,
+                       "answer": "the user refused this Notion write on the desktop"}
+            else:
+                res = run_local_agent(self.claude, t["task"], self.folders, self.timeout,
+                                      t["kind"], self.notion_parent)
             with self.lock:
                 t.update(res)
             print(f"           {res['status']} in {res['seconds']} s", flush=True)
@@ -1172,9 +1251,9 @@ class Bridge:
             log.parent.mkdir(parents=True, exist_ok=True)
             with log.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"time": dt.datetime.now().isoformat(timespec="seconds"),
-                                     "project": t["project"], "task": t["task"],
+                                     "project": t["project"], "kind": t["kind"], "task": t["task"],
                                      "status": res["status"], "seconds": res["seconds"],
-                                     "answer_chars": len(res["answer"])}) + "\n")
+                                     "answer": res["answer"]}) + "\n")
 
 
 def bridge_handler(bridge: Bridge):
@@ -1201,7 +1280,8 @@ def bridge_handler(bridge: Bridge):
             if not self.authorized():
                 return
             if self.path == "/health":
-                return self.reply(200, {"ok": True})
+                return self.reply(200, {"ok": True, "kinds": list(KINDS),
+                                        "notion_parent": bool(bridge.notion_parent)})
             m = re.fullmatch(r"/tasks/([0-9a-f]+)", self.path)
             with bridge.lock:
                 t = bridge.tasks.get(m.group(1)) if m else None
@@ -1223,7 +1303,10 @@ def bridge_handler(bridge: Bridge):
                 return self.reply(400, {"error": "body must be {\"task\": ..., \"project\": ...}"})
             if not task:
                 return self.reply(400, {"error": "empty task"})
-            self.reply(202, {"id": bridge.submit(task, str(body.get("project") or ""))})
+            kind = str(body.get("kind") or "files")
+            if kind not in KINDS:
+                return self.reply(400, {"error": f"kind must be one of {', '.join(KINDS)}"})
+            self.reply(202, {"id": bridge.submit(task, str(body.get("project") or ""), kind)})
 
     return Handler
 
@@ -1248,9 +1331,16 @@ def cmd_bridge(a):
     if a.ssh:
         b["ssh"] = a.ssh
     if a.folder:
-        b["folders"] = [str(Path(f).expanduser().resolve()) for f in a.folder]
+        folders = [Path(f).expanduser().resolve() for f in a.folder]
+        broad = [str(f) for f in folders if f == Path.home().resolve() or f == Path(f.anchor)]
+        if broad:
+            die(f"too broad: {', '.join(broad)}. Allow the folders your research material is "
+                "in (e.g. Documents\\Research), not your whole home folder or a drive.")
+        b["folders"] = [str(f) for f in folders]
     if a.claude:
         b["claude"] = a.claude
+    if a.notion_parent:
+        b["notion_parent"] = a.notion_parent
     save_config(cfg)
     folders = b.get("folders") or []
     if not folders:
@@ -1258,6 +1348,12 @@ def cmd_bridge(a):
     missing = [f for f in folders if not Path(f).is_dir()]
     if missing:
         die(f"allowed folder(s) not found: {', '.join(missing)}")
+    blocked_dirs = {p.split("/")[0] for p in BLOCKED_READS if p.endswith("/**")}
+    for f in folders:
+        hit = blocked_dirs.intersection(Path(f).parts)
+        if hit:
+            print(f"Warning: {f} is inside {', '.join(sorted(hit))}, which the local agent may "
+                  "never read: it won't see anything in this folder.")
     claude = find_claude(b.get("claude"))
     if not claude:
         die("Claude Code not found: no `claude` on PATH and no VS Code extension binary. "
@@ -1265,12 +1361,15 @@ def cmd_bridge(a):
     if not a.no_ssh and not b.get("ssh"):
         die("which server? rh bridge --ssh <host as in your ssh config, e.g. lab>")
 
-    bridge = Bridge(claude, folders, a.timeout)
+    bridge = Bridge(claude, folders, a.timeout, b.get("notion_parent", ""))
     server = ThreadingHTTPServer(("127.0.0.1", 0), bridge_handler(bridge))
     lport = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"Local agent: {claude}")
     print("Allowed folders (read-only):\n" + "\n".join(f"  {f}" for f in folders))
+    print("Notion: " + (f"read, and write after your Yes, under {b['notion_parent']}"
+                        if b.get("notion_parent") else
+                        "read only (set a home page with --notion-parent <link> to allow writes)"))
 
     if a.no_ssh:  # testing, or the hub runs on this same machine
         bridge.token = secrets.token_urlsafe(32)
@@ -1364,9 +1463,16 @@ def bridge_call(method: str, path: str, body=None, timeout=15):
         raise BridgeDown(str(getattr(e, "reason", e)))
 
 
-def ask_desktop(task: str, project: str, wait: int):
+def ask_desktop(task: str, project: str, wait: int, kind: str = "files"):
     """Returns (task id, result dict or None if still running). Raises BridgeDown."""
-    tid = bridge_call("POST", "/tasks", {"task": task, "project": project})["id"]
+    if kind != "files":
+        health = bridge_call("GET", "/health")
+        if kind not in health.get("kinds", []):
+            die("the desktop's kit is too old for Notion tasks: on the desktop, `git pull` in "
+                "the kit folder, then restart `rh bridge`")
+        if kind == "notion-write" and not health.get("notion_parent"):
+            die("no Notion home page on the desktop: rh bridge --notion-parent <page link> (once)")
+    tid = bridge_call("POST", "/tasks", {"task": task, "project": project, "kind": kind})["id"]
     return tid, poll_desktop(tid, wait)
 
 
@@ -1381,7 +1487,7 @@ def poll_desktop(tid: str, wait: int):
         time.sleep(3)
 
 
-def record_local(pdir: Path, task: str, res: dict, asked: str) -> Path:
+def record_local(pdir: Path, task: str, res: dict, asked: str, kind: str = "files") -> Path:
     first = task.strip().splitlines()[0]
     slug = slugify(" ".join(first.split()[:6]))[:50]
     out = pdir / "local" / f"{today()}-{slug}.md"
@@ -1390,8 +1496,9 @@ def record_local(pdir: Path, task: str, res: dict, asked: str) -> Path:
         out = out.with_name(f"{today()}-{slug}-{n}.md")
         n += 1
     out.parent.mkdir(parents=True, exist_ok=True)
+    source = "desktop" if kind == "files" else f"desktop ({kind})"
     out.write_text(
-        f"---\nsource: desktop\nasked: {asked}\n"
+        f"---\nsource: {source}\nasked: {asked}\n"
         f"answered: {dt.datetime.now().isoformat(timespec='seconds')}\n"
         f"seconds: {res.get('seconds')}\n---\n# {first[:100]}\n\n"
         f"## Task\n{task.strip()}\n\n## Answer\n{(res.get('answer') or '').strip()}\n",
@@ -1400,17 +1507,24 @@ def record_local(pdir: Path, task: str, res: dict, asked: str) -> Path:
 
 
 REQ_RE = re.compile(r"^## (R\d+) · (\S+ \S+) · (.*)$", re.M)
+KIND_RE = re.compile(r"\A\[(notion-read|notion-write)\]\s*")
 
 
 def read_requests(f: Path) -> list:
     text = f.read_text(encoding="utf-8") if f.exists() else ""
     ms = list(REQ_RE.finditer(text))
-    return [{"id": m.group(1), "asked": m.group(2), "status": m.group(3).strip(),
-             "task": text[m.end():ms[i + 1].start() if i + 1 < len(ms) else len(text)].strip()}
-            for i, m in enumerate(ms)]
+    reqs = []
+    for i, m in enumerate(ms):
+        body = text[m.end():ms[i + 1].start() if i + 1 < len(ms) else len(text)].strip()
+        k = KIND_RE.match(body)
+        reqs.append({"id": m.group(1), "asked": m.group(2), "status": m.group(3).strip(),
+                     "kind": k.group(1) if k else "files", "task": body[k.end():] if k else body})
+    return reqs
 
 
-def queue_request(pdir: Path, task: str) -> str:
+def queue_request(pdir: Path, task: str, kind: str = "files") -> str:
+    if kind != "files":
+        task = f"[{kind}] {task.strip()}"
     f = pdir / "requests.md"
     reqs = read_requests(f)
     rid = f"R{len(reqs) + 1:03d}"
@@ -1436,9 +1550,13 @@ def cmd_ask_local(a):
     if a.drain:
         drain_requests(hub)
         return
-    if not a.project:
-        die("--project is required (answers are recorded in the project)")
-    pdir = project_dir(hub, a.project)
+    # Answers are recorded in the project, or at the hub level for cross-project
+    # tasks (e.g. publishing the daily report).
+    pdir = project_dir(hub, a.project) if a.project else hub
+    pname = pdir.name if a.project else ""
+    where = f"{pname}/" if pname else ""
+    proj_opt = f"--project {pname} " if pname else ""
+    kind = f"notion-{a.notion}" if a.notion else "files"
     asked = dt.datetime.now().isoformat(timespec="seconds")
     try:
         if a.result:
@@ -1448,21 +1566,22 @@ def cmd_ask_local(a):
             if not a.task:
                 die("give the task: rh ask-local --project P \"<what to read or analyze>\"")
             task = a.task
-            tid, res = ask_desktop(task, pdir.name, a.wait)
+            tid, res = ask_desktop(task, pname, a.wait, kind)
     except BridgeDown as e:
         if a.result:
             die(f"desktop unreachable ({e}); the answer to {a.result} is lost if the bridge restarted")
-        rid = queue_request(pdir, a.task)
-        print(f"queued as {rid} in {pdir.name}/requests.md: the desktop is offline ({e}).\n"
+        rid = queue_request(pdir, a.task, kind)
+        print(f"queued as {rid} in {where}requests.md: the desktop is offline ({e}).\n"
               "It will be answered automatically when the user starts `rh bridge` on the desktop.")
         sys.exit(QUEUED_EXIT)
     if res is None:
-        print(f"still running on the desktop. Fetch it later with:\n"
-              f"  rh ask-local --project {pdir.name} --result {tid} \"<same task>\"")
+        wait = " (a Notion write waits for the user's Yes on the desktop)" if kind == "notion-write" else ""
+        print(f"still running on the desktop{wait}. Fetch it later with:\n"
+              f"  rh ask-local {proj_opt}--result {tid} \"<same task>\"")
         sys.exit(QUEUED_EXIT)
     if res["status"] != "done":
         die(f"the desktop agent failed: {res.get('answer')}")
-    out = record_local(pdir, task, res, asked)
+    out = record_local(pdir, task, res, asked, kind)
     print(res["answer"].strip())
     print(f"\n(recorded in {out.relative_to(hub).as_posix()})")
 
@@ -1476,21 +1595,128 @@ def drain_requests(hub: Path) -> None:
             time.sleep(3)
     else:
         die("desktop bridge unreachable; pending requests stay queued")
-    for f in sorted((hub / "projects").glob("*/requests.md")):
+    for f in [hub / "requests.md"] + sorted((hub / "projects").glob("*/requests.md")):
         pdir = f.parent
+        pname = "" if pdir == hub else pdir.name
         for r in read_requests(f):
             if r["status"] != "pending":
                 continue
             try:
-                _, res = ask_desktop(r["task"], pdir.name, 1800)
+                _, res = ask_desktop(r["task"], pname, 1800, r["kind"])
             except BridgeDown as e:
                 die(f"bridge lost while draining ({e}); the rest stays queued")
             if res and res["status"] == "done":
-                out = record_local(pdir, r["task"], res, r["asked"])
+                out = record_local(pdir, r["task"], res, r["asked"], r["kind"])
                 set_request_status(pdir, r["id"], f"answered → {out.relative_to(pdir).as_posix()}")
-                print(f"{pdir.name} {r['id']}: answered")
+                print(f"{pname or 'hub'} {r['id']}: answered")
             else:
-                print(f"{pdir.name} {r['id']}: {'failed' if res else 'timed out'}; left pending")
+                print(f"{pname or 'hub'} {r['id']}: {'failed' if res else 'timed out'}; left pending")
+
+
+# --------------------------------------------------------------- activity
+# Facts for /rh-daily: what moved on one day, from git histories and hub files.
+def _commits(repo: Path, since: str, until: str, all_refs: bool) -> list:
+    args = ["log", "--since", since, "--until", until, "--format=%x1e%h%x1f%an%x1f%S%x1f%s",
+            "--name-only"] + (["--all", "--source"] if all_refs else [])
+    out = git(repo, *args, check=False).stdout
+    commits = []
+    for rec in out.split("\x1e")[1:]:
+        head, _, files = rec.partition("\n")
+        h, author, ref, subject = (head.split("\x1f") + ["", "", "", ""])[:4]
+        commits.append({"hash": h, "author": author, "ref": ref.replace("refs/heads/", ""),
+                        "subject": subject, "files": [f for f in files.splitlines() if f]})
+    return commits
+
+
+def _linked_repos(hub: Path) -> list:
+    return [l for l in sorted((hub / "repos").iterdir()) if l.is_symlink() and l.exists()]
+
+
+def activity_days(hub: Path, back: int = 21) -> set:
+    days = set()
+    for repo, all_refs in [(hub, False)] + [(l, True) for l in _linked_repos(hub)]:
+        out = git(repo, "log", f"--since={back}.days", "--format=%cd", "--date=short",
+                  *(["--all"] if all_refs else []), check=False).stdout
+        days.update(out.split())
+    for f in list((hub / "projects").glob("*/local/*.md")) + list((hub / "local").glob("*.md")):
+        days.add(f.name[:10])
+    return {d for d in days if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)}
+
+
+def collect_activity(hub: Path, day: dt.date) -> dict:
+    since, until = f"{day} 00:00", f"{day + dt.timedelta(days=1)} 00:00"
+    hub_commits = _commits(hub, since, until, False)
+    plans = {}
+    for c in hub_commits:
+        c["projects"] = sorted({f.split("/")[1] for f in c["files"]
+                                if f.startswith("projects/") and f.count("/") >= 2})
+        for f in c["files"]:
+            m = re.match(r"projects/([^/]+)/plans/([^/]+)/", f)
+            if m:
+                plans[f"{m.group(1)}/{m.group(2)}"] = None
+    for key in plans:
+        p, pid = key.split("/", 1)
+        pf = hub / "projects" / p / "plans" / pid / "plan.md"
+        plans[key] = read_fm(pf.read_text(encoding="utf-8"))[0].get("status", "?") if pf.exists() else "removed"
+    repos = {}
+    for link in _linked_repos(hub):
+        cs = _commits(link, since, until, True)
+        if cs:
+            repos[link.name] = cs
+    answers, waiting = [], []
+    for pdir in [hub] + sorted(d for d in (hub / "projects").glob("*") if d.is_dir()):
+        pname = "hub" if pdir == hub else pdir.name
+        for f in sorted((pdir / "local").glob(f"{day}-*.md")):
+            title = next((l[2:].strip() for l in f.read_text(encoding="utf-8").splitlines()
+                          if l.startswith("# ")), f.stem)
+            answers.append({"project": pname, "title": title, "file": f.relative_to(hub).as_posix()})
+        waiting += [{"project": pname, "id": r["id"], "kind": r["kind"],
+                     "task": r["task"].splitlines()[0][:80] if r["task"] else ""}
+                    for r in read_requests(pdir / "requests.md") if r["status"] == "pending"]
+    return {"day": str(day), "weekday": day.strftime("%A"), "hub_commits": hub_commits,
+            "plans": plans, "repos": repos, "desktop_answers": answers, "waiting_now": waiting}
+
+
+def cmd_activity(a):
+    hub = find_hub()
+    if a.day:
+        try:
+            day = dt.date.fromisoformat(a.day)
+        except ValueError:
+            die("--day must be YYYY-MM-DD")
+    else:
+        past = sorted(d for d in activity_days(hub) if d < today())
+        if not past:
+            die("no activity in the last 21 days")
+        day = dt.date.fromisoformat(past[-1])
+    act = collect_activity(hub, day)
+    if a.json:
+        print(json.dumps(act, indent=2, ensure_ascii=False))
+        return
+    print(f"Activity on {act['day']} ({act['weekday']})" + ("" if a.day else ", the last work day"))
+    print(f"\n## Hub ({len(act['hub_commits'])} commits)")
+    for c in act["hub_commits"]:
+        print(f"- [{', '.join(c['projects']) or 'hub'}] {c['subject']}")
+    if act["plans"]:
+        print("\n## Plans touched (status now)")
+        for k, st in act["plans"].items():
+            print(f"- {k}: {st}")
+    print(f"\n## Code bases ({sum(len(v) for v in act['repos'].values())} commits)")
+    for name, cs in act["repos"].items():
+        by_ref = collections.Counter(c["ref"] or "?" for c in cs)
+        print(f"- {name}: " + ", ".join(f"{n} on {r}" for r, n in by_ref.most_common()))
+        for c in cs[:5]:
+            print(f"    {c['hash']} {c['subject']} ({c['author']})")
+        if len(cs) > 5:
+            print(f"    ... {len(cs) - 5} more")
+    if act["desktop_answers"]:
+        print("\n## Desktop answers")
+        for x in act["desktop_answers"]:
+            print(f"- [{x['project']}] {x['title']}  ({x['file']})")
+    if act["waiting_now"]:
+        print("\n## Waiting now (desktop requests)")
+        for x in act["waiting_now"]:
+            print(f"- [{x['project']}] {x['id']} {x['kind']}: {x['task']}")
 
 
 ZOTERO_MCP = {"command": "uvx", "args": ["zotero-mcp"],
@@ -1625,6 +1851,8 @@ def main():
     s.add_argument("--folder", action="append", help="folder the local agent may read (repeatable; saved)")
     s.add_argument("--claude", help="path to claude / claude.exe (default: PATH, then VS Code extension)")
     s.add_argument("--timeout", type=int, default=900, help="seconds per task (default 900)")
+    s.add_argument("--notion-parent", metavar="LINK",
+                   help="Notion page under which new pages may be created (saved)")
     s.add_argument("--no-ssh", action="store_true", help="register on this machine (testing)")
     s.set_defaults(fn=cmd_bridge)
 
@@ -1639,7 +1867,14 @@ def main():
     s.add_argument("--wait", type=int, default=540, help="seconds to wait (default 540)")
     s.add_argument("--result", metavar="ID", help="fetch a task that was still running")
     s.add_argument("--drain", action="store_true", help="send queued requests (run on connect)")
+    s.add_argument("--notion", choices=["read", "write"],
+                   help="a Notion task (your claude.ai connector, on the desktop); write asks you first")
     s.set_defaults(fn=cmd_ask_local)
+
+    s = sub.add_parser("activity", help="facts for a daily report: what moved on a given day")
+    s.add_argument("--day", help="YYYY-MM-DD (default: last work day before today)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_activity)
 
     s = sub.add_parser("zotero-enable", help="register the Zotero MCP server (Web API) in the hub")
     s.set_defaults(fn=cmd_zotero_enable)

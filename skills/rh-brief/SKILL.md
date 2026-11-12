@@ -11,6 +11,7 @@ Read: plans updated since then (`updated:` front-matter, Changelog,
 Validation log), `impl/*.md` logs, `results/*/summary.md`, the Decisions log in
 `project.md`, open questions in plans and meetings, and desktop answers in
 `local/` since then. Papers to cite or compare with: the `zotero` tools.
+Daily reports in `reports/daily/` since then are a quick index of what moved.
 
 ## 2. Write `projects/<p>/reports/<date>-brief.md` (template `brief.md`)
 - **TL;DR:** 3 bullets max, the most important first.
@@ -27,3 +28,7 @@ Factual tone, no hype, short. One page if possible.
 ## 3. Finish
 Commit the hub. Show me the brief and ask what to change. If I want it as
 slides or a document, help with that as a separate step.
+
+Once I'm happy with it, ask "Publish to Notion?"; only if yes, use **rh-local**
+(`--notion write`, the brief verbatim, as a new page under my Notion home page)
+and add the returned `Notion page:` link at the end of the brief file.
